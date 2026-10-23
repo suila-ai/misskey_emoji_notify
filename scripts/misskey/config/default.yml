@@ -1,0 +1,22 @@
+# 開発用の使い捨て Misskey の設定。上流の .config/docker_example.yml（2026.3.2）からコメントを除き、url を変えた。
+url: http://localhost:3000/
+port: 3000
+db:
+  host: db
+  port: 5432
+  db: misskey
+  user: example-misskey-user
+  pass: example-misskey-pass
+dbReplications: false
+redis:
+  host: redis
+  port: 6379
+fulltextSearch:
+  provider: sqlLike
+id: 'aidx'
+proxyBypassHosts:
+  - api.deepl.com
+  - api-free.deepl.com
+  - www.recaptcha.net
+  - hcaptcha.com
+  - challenges.cloudflare.com
