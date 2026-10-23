@@ -1,0 +1,27 @@
+# Dependabot の version updates を使うには、更新するパッケージエコシステムと、
+# パッケージのマニフェストがある場所を指定する。詳しくは次の文書を参照。
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+# https://containers.dev/guide/dependabot
+
+version: 2
+updates:
+ - package-ecosystem: "devcontainers"
+   directory: "/"
+   schedule:
+     interval: weekly
+ - package-ecosystem: "docker"
+   directory: "/.devcontainer"
+   schedule:
+     interval: weekly
+ - package-ecosystem: "docker"
+   directory: "/"
+   schedule:
+     interval: weekly
+ - package-ecosystem: "cargo"
+   directory: "/"
+   schedule:
+     interval: weekly
+ - package-ecosystem: "github-actions"
+   directory: "/"
+   schedule:
+     interval: weekly
