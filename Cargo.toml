@@ -1,0 +1,6 @@
+[package]
+name = "misskey_emoji_notify"
+version = "2.0.0"
+edition = "2024"
+
+[dependencies]
