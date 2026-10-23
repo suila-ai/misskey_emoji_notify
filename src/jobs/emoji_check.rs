@@ -165,7 +165,15 @@ impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
 
     async fn post_changes(&self, visibility: Visibility, texts: &[String]) {
         for text in texts {
-            match self.misskey.create_note(NewNote { text, visibility }).await {
+            match self
+                .misskey
+                .create_note(NewNote {
+                    text,
+                    visibility,
+                    reply_id: None,
+                })
+                .await
+            {
                 Ok(note) => info!(note_id = %note.id, "posted"),
                 Err(error) => {
                     error!(error = %crate::error_chain(&error), length = mfm::note_length(text), "failed to post a change; it will not be retried")
@@ -632,6 +640,29 @@ mod tests {
         assert!(texts[0].starts_with("【絵文字削除】"), "{}", texts[0]);
         assert!(shared.read().unwrap().as_ref().unwrap().is_empty());
         assert!(!image.exists());
+    }
+
+    #[tokio::test]
+    async fn without_notify_and_banner_no_image_is_fetched_and_nothing_is_posted() {
+        let dir = TempDir::new();
+        let misskey = FakeMisskey::new().with_emojis(vec![emoji("a", None, &[], "u-a")]);
+        let shared = shared();
+        let job = EmojiCheckJob::new(
+            &misskey,
+            fetcher(),
+            &config(&dir, "[mention]\n[mention.gacha]\n"),
+            shared.clone(),
+        );
+        job.run().await.unwrap();
+        misskey.set_emojis(vec![
+            emoji("a", None, &[], "u-a"),
+            emoji("b", None, &[], "u-b"),
+        ]);
+        job.run().await.unwrap();
+        assert!(job.fetcher.calls.lock().unwrap().is_empty());
+        assert!(misskey.texts().is_empty());
+        assert_eq!(shared.read().unwrap().as_ref().unwrap().len(), 2);
+        assert!(!dir.join("images").exists());
     }
 
     #[tokio::test]

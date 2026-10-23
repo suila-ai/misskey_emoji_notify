@@ -1,8 +1,8 @@
 //! TOML の設定ファイル。起動時に 1 回だけ読む。
 //!
 //! 設定は、それが効くものごとの節に置く。`[emoji]` は絵文字一覧の確認（`state_dir` と `cron`）で、その一覧から作る通知と
-//! バナーを `[emoji.notify]` と `[emoji.banner]` に書く。`[ranking]` は前日のリアクションのランキング。
-//! `[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
+//! バナーを `[emoji.notify]` と `[emoji.banner]` に書く。`[ranking]` は前日のリアクションのランキング、`[mention]` は
+//! メンションへの応答（`[mention.gacha]` と `[mention.fortune]`）。`[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -28,9 +28,11 @@ pub struct Config {
     pub emoji: EmojiConfig,
     /// 前日のリアクションのランキング。
     pub ranking: Option<RankingConfig>,
+    /// メンションへの応答。
+    pub mention: Option<MentionConfig>,
 }
 
-/// 絵文字一覧の確認。通知かバナーを使うときに動く。
+/// 絵文字一覧の確認。通知・バナー・ガチャ・占いのどれかを使うときに動く。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmojiConfig {
@@ -62,7 +64,7 @@ impl Default for EmojiConfig {
 pub struct MisskeyConfig {
     /// サーバのベース URL。
     pub server: Url,
-    /// アクセストークン。`read:account`、`write:account`、`read:drive`、`write:drive`、`write:notes` の権限が要る。
+    /// アクセストークン。`read:account`、`write:account`、`read:drive`、`write:drive`、`write:notes`、`write:reactions` の権限が要る。
     pub token: String,
 }
 
@@ -89,9 +91,50 @@ pub struct RankingConfig {
     pub cron: Cron,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MentionConfig {
+    /// フォローしていない相手のメンションを無視するか。
+    #[serde(default)]
+    pub require_followed: RequireFollowed,
+    pub gacha: Option<GachaConfig>,
+    pub fortune: Option<FortuneConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GachaConfig {
+    /// 返信の公開範囲。メンション元が `specified` ならこの設定に関わらず `specified`。
+    #[serde(default)]
+    pub visibility: Visibility,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FortuneConfig {
+    #[serde(default)]
+    pub visibility: Visibility,
+    /// 結果に使う絵文字のカテゴリ。空なら全絵文字。
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+/// フォローしていない相手のメンションを無視する範囲。設定には小文字で書く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequireFollowed {
+    /// 無視しない。
+    #[default]
+    None,
+    /// リモートのユーザーだけ無視する。
+    Remote,
+    /// 全員。
+    All,
+}
+
 /// ノートの公開範囲。設定には小文字で書く。
 ///
-/// `Specified` は宛先を付けずに送り、自分だけが読めるノートにする（デバッグ用）。
+/// `Specified` は宛先を付けずに送り、自分だけが読めるノートにする（デバッグ用）。返信では、Misskey が返信先のユーザーを宛先に足す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
@@ -121,6 +164,8 @@ pub enum Error {
         #[source]
         source: Box<toml::de::Error>,
     },
+    #[error("[mention] needs at least one of [mention.gacha] and [mention.fortune]")]
+    MentionWithoutHandlers,
 }
 
 impl Config {
@@ -147,12 +192,25 @@ impl Config {
                 source: Box::new(source),
             }
         })?;
+        config.validate()?;
         Ok(config)
     }
 
-    /// 絵文字の一覧を確かめるジョブが要るか。通知かバナーがあるとき。
+    /// 節の組み合わせを確かめる。`[mention]` があるのに応答する機能が無ければエラー（つないでも ❓ を返すだけになる）。
+    fn validate(&self) -> Result<(), Error> {
+        if let Some(mention) = &self.mention
+            && mention.gacha.is_none()
+            && mention.fortune.is_none()
+        {
+            return Err(Error::MentionWithoutHandlers);
+        }
+        Ok(())
+    }
+
+    /// 絵文字の一覧を確かめるジョブが要るか。通知・バナー・ガチャ・占いのどれかがあるとき。
+    /// `[mention]` には、[`validate`](Self::validate) でガチャか占いのどちらかがある。
     pub fn needs_emoji_check(&self) -> bool {
-        self.emoji.notify.is_some() || self.emoji.banner.is_some()
+        self.emoji.notify.is_some() || self.emoji.banner.is_some() || self.mention.is_some()
     }
 }
 
@@ -202,11 +260,13 @@ token = "token"
 "#;
 
     fn parse(text: &str) -> Result<Config, Error> {
-        text.parse().map_err(|source| Error::Parse {
+        let config: Config = text.parse().map_err(|source| Error::Parse {
             path: PathBuf::new(),
             line: None,
             source: Box::new(source),
-        })
+        })?;
+        config.validate()?;
+        Ok(config)
     }
 
     #[test]
@@ -222,6 +282,7 @@ token = "token"
         assert!(config.emoji.notify.is_none());
         assert!(config.emoji.banner.is_none());
         assert!(config.ranking.is_none());
+        assert!(config.mention.is_none());
         assert!(!config.needs_emoji_check());
     }
 
@@ -241,6 +302,15 @@ visibility = "specified"
 [ranking]
 visibility = "public"
 cron = "0 30 0 * * *"
+
+[mention]
+require_followed = "remote"
+
+[mention.gacha]
+visibility = "followers"
+
+[mention.fortune]
+categories = ["TEXT", "顔"]
 "#
         );
         let config = parse(&text).unwrap();
@@ -254,12 +324,18 @@ cron = "0 30 0 * * *"
         let ranking = config.ranking.unwrap();
         assert_eq!(ranking.visibility, Visibility::Public);
         assert_eq!(ranking.cron, parse_cron("0 30 0 * * *").unwrap());
+        let mention = config.mention.unwrap();
+        assert_eq!(mention.require_followed, RequireFollowed::Remote);
+        assert_eq!(mention.gacha.unwrap().visibility, Visibility::Followers);
+        let fortune = mention.fortune.unwrap();
+        assert_eq!(fortune.visibility, Visibility::Home);
+        assert_eq!(fortune.categories, ["TEXT", "顔"]);
     }
 
     #[test]
     fn the_emoji_check_runs_when_any_consumer_is_configured() {
-        let notify_only = parse(&format!("{MINIMAL}\n[emoji.notify]\n")).unwrap();
-        assert!(notify_only.needs_emoji_check());
+        let gacha_only = parse(&format!("{MINIMAL}\n[mention]\n[mention.gacha]\n")).unwrap();
+        assert!(gacha_only.needs_emoji_check());
         let banner_only = parse(&format!("{MINIMAL}\n[emoji.banner]\n")).unwrap();
         assert!(banner_only.needs_emoji_check());
         let ranking_only = parse(&format!("{MINIMAL}\n[ranking]\n")).unwrap();
@@ -267,6 +343,15 @@ cron = "0 30 0 * * *"
         // [emoji] は確認の設定だけで、機能の節ではない。
         let settings_only = parse(&format!("{MINIMAL}\n[emoji]\nstate_dir = \"x\"\n")).unwrap();
         assert!(!settings_only.needs_emoji_check());
+    }
+
+    #[test]
+    fn a_mention_section_without_handlers_is_an_error() {
+        let error = parse(&format!(
+            "{MINIMAL}\n[mention]\nrequire_followed = \"all\"\n"
+        ))
+        .unwrap_err();
+        assert!(matches!(error, Error::MentionWithoutHandlers), "{error}");
     }
 
     #[test]
@@ -318,6 +403,9 @@ cron = "0 30 0 * * *"
                 && config.emoji.banner.is_some()
                 && config.ranking.is_some()
         );
+        let mention = config.mention.unwrap();
+        assert!(mention.gacha.is_some() && mention.fortune.is_some());
+        assert!(mention.fortune.unwrap().categories.is_empty());
     }
 
     #[test]

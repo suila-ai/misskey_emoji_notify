@@ -1,11 +1,11 @@
 # misskey_emoji_notify の設定。config.toml に写して書き換える。
 
 [misskey]
-# サーバのベース URL とアクセストークン。トークンには read:account、write:account、read:drive、write:drive、write:notes の権限が要る
+# サーバのベース URL とアクセストークン。トークンには read:account、write:account、read:drive、write:drive、write:notes、write:reactions の権限が要る
 server = "https://misskey.example.com"
 token = ""
 
-# 絵文字一覧の確認。通知かバナーを使うときに動く
+# 絵文字一覧の確認。通知・バナー・ガチャ・占いのどれかを使うときに動く
 [emoji]
 # 一覧の控えと画像の置き場。省くと作業ディレクトリの state（compose.yaml はコンテナの作業ディレクトリ /app の state にボリュームを当てる）
 #state_dir = "state"
@@ -25,3 +25,19 @@ visibility = "home"
 visibility = "home"
 # 集計して投稿する時刻（cron 式、JST）。省くと 0 時
 #cron = "0 0 0 * * *"
+
+# メンションへの応答。節を省くとストリーミングにつながない。gacha と fortune の少なくとも一方が要る
+[mention]
+# フォローしていない相手のメンションを無視する: none（無視しない）/ remote（リモートのユーザーだけ無視）/ all。省くと none
+require_followed = "none"
+
+# ガチャ（「ガチャ [個数] [カテゴリ...]」）。節を省くと応答しない
+[mention.gacha]
+# 返信の公開範囲。省くと home。メンション元が specified なら、この設定に関わらず specified
+visibility = "home"
+
+# 占い（「占」「うらな」「運勢」「おみくじ」のどれかを含むメンション）。節を省くと応答しない
+[mention.fortune]
+visibility = "home"
+# 結果に使う絵文字のカテゴリ。省くか空なら全絵文字
+categories = []

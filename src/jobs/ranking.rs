@@ -201,6 +201,7 @@ impl<M: Misskey> RankingJob<'_, M> {
             .create_note(NewNote {
                 text: &text,
                 visibility: self.visibility,
+                reply_id: None,
             })
             .await?;
         info!(note_id = %note.id, %target, notes = ranking.notes, reactions = ranking.reactions, "posted");

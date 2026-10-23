@@ -1,4 +1,4 @@
-//! 日本時間の扱い。ランキングの対象日は JST で決める。
+//! 日本時間の扱い。ランキングの対象日と占いの日付は JST で決める。
 
 use chrono::{DateTime, FixedOffset, Utc};
 

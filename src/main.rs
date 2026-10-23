@@ -1,15 +1,18 @@
 //! Misskey のカスタム絵文字の変更を通知する bot。
 //!
-//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿し、全絵文字を並べたバナーを作り、前日のリアクションのランキングを投稿する。
+//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿し、全絵文字を並べたバナーを作り、前日のリアクションのランキングを投稿し、
+//! メンションにガチャと占いで応答する。
 
 mod banner;
 mod config;
 mod emoji;
 mod images;
 mod jobs;
+mod mention;
 mod mfm;
 mod misskey;
 mod scheduler;
+mod ssv;
 mod state;
 mod time;
 
@@ -47,7 +50,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// compose.yaml の `stop_grace_period` はこれより長くする。
 const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// 絵文字の一覧。起動時に控えから読み、絵文字の確認が差し替える。
+/// ジョブと mention で共有する絵文字の一覧。絵文字の確認が差し替え、mention が `Arc` を clone して使う。
 /// `None` は控えが無いこと（初回）を表し、最初の確認で `Some` になる。
 pub type SharedEmojiSet = Arc<RwLock<Option<Arc<EmojiSet>>>>;
 
@@ -89,7 +92,7 @@ async fn run() -> Result<(), Error> {
             emoji_set.clone(),
         ))
     } else {
-        info!("no notify or banner is configured; the emoji check will not run");
+        info!("no notify, banner, gacha or fortune is configured; the emoji check will not run");
         None
     };
     let ranking = config.ranking.as_ref().map(|ranking| {
@@ -107,10 +110,25 @@ async fn run() -> Result<(), Error> {
             shutdown.cancel();
         }
     };
+    let mentions = async {
+        let Some(mention_config) = &config.mention else {
+            return;
+        };
+        // つなぎ始めた時刻。つながるまで試し直していた間のメンションも、ここから取り直す。
+        let opened_at = time::now().to_utc();
+        let Some(source) = mention::connect(|| misskey.mentions(), &shutdown).await else {
+            return;
+        };
+        let responder =
+            mention::Responder::new(&misskey, mention_config, emoji_set.clone(), time::now);
+        mention::run(source, &responder, opened_at, &shutdown).await;
+    };
+
     tokio::join!(
         signals,
         run_if_configured(emoji_check.map(|job| (job, &config.emoji.cron)), &shutdown),
         run_if_configured(ranking, &shutdown),
+        mentions,
     );
     info!("stopped");
     Ok(())

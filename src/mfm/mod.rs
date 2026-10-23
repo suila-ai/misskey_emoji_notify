@@ -1,6 +1,7 @@
 //! Misskey に投稿する本文（MFM）の組み立て。純粋関数にして、旧 C# 版の本文と文字列で厳密に比べる。
 
 pub mod emoji;
+pub mod mention;
 pub mod ranking;
 
 /// ノートの本文の上限。Misskey の `maxNoteTextLength` の既定で、接続先のサーバも同じ。

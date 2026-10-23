@@ -1,13 +1,16 @@
 //! Misskey へのアクセス。miapi（Misskey 2025.10.0 のバインディング。2026.5.0 までのサーバを読める）を使う。
 //!
-//! ジョブは [`Misskey`] トレイト越しに使い、テストでは `fake::FakeMisskey` に差し替える。
+//! ジョブと mention は [`Misskey`] トレイト越しに使い、テストでは `fake::FakeMisskey` に差し替える。
+//! メンションのストリームは、REST と寿命が違うので [`MentionSource`] に分ける。
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use miapi::v2025_10_0::api::notes::create::RequestVisibility;
+use miapi::v2025_10_0::api::users::show::Response as UserShowResponse;
+use miapi::v2025_10_0::streaming::main;
 use miapi::v2025_10_0::{Client, types};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::config::Visibility;
@@ -41,9 +44,22 @@ pub struct Note {
     pub id: String,
     /// 本文。本文の無いノート（ファイルだけ等）は空。
     pub text: String,
+    pub cw: Option<String>,
+    pub user: NoteUser,
     pub created_at: DateTime<Utc>,
+    /// 公開範囲が `specified` か。返信の公開範囲を決めるのに使う。
+    pub is_specified: bool,
     /// リアクションの絵文字（`:name@.:` や Unicode）ごとの数。
     pub reactions: HashMap<String, u64>,
+}
+
+/// ノートの投稿者の、必要なところだけ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteUser {
+    pub id: String,
+    /// リモートのユーザーのホスト。ローカルなら `None`。
+    pub host: Option<String>,
+    pub is_bot: bool,
 }
 
 /// これから作るノート。
@@ -51,6 +67,8 @@ pub struct Note {
 pub struct NewNote<'a> {
     pub text: &'a str,
     pub visibility: Visibility,
+    /// 返信先。
+    pub reply_id: Option<&'a str>,
 }
 
 /// [`Misskey::local_timeline`] と [`Misskey::my_notes`] の起点。この時刻か ID より前のものを返す。
@@ -72,10 +90,15 @@ pub trait Misskey {
     /// ローカルのカスタム絵文字の一覧。
     async fn emojis(&self) -> Result<Vec<Emoji>, Error>;
     async fn create_note(&self, note: NewNote<'_>) -> Result<Note, Error>;
+    async fn react(&self, note_id: &str, reaction: &str) -> Result<(), Error>;
+    /// `user_id` が自分をフォローしているか。分からなければ `false`。
+    async fn is_followed_by(&self, user_id: &str) -> Result<bool, Error>;
     /// `until` より前のローカルタイムラインのノート。新しい順に `limit` 件まで。
     async fn local_timeline(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error>;
     /// `until` より前の自分のノート。新しい順に `limit` 件まで。他人への返信を含み、リノートは含めない。
     async fn my_notes(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error>;
+    /// `since` より後の、自分へのメンション。古い順に `limit` 件まで。
+    async fn mentions_since(&self, since: &Since, limit: u8) -> Result<Vec<Note>, Error>;
     /// ドライブにファイルを上げ、その ID を返す。中身が既存のファイルと同じでも、新しいファイルにする。
     async fn upload_file(
         &self,
@@ -88,6 +111,27 @@ pub trait Misskey {
     /// `file_id` のファイルをバナーにする。`None` ならバナーを外す。
     async fn set_banner(&self, file_id: Option<&str>) -> Result<(), Error>;
     async fn delete_file(&self, file_id: &str) -> Result<(), Error>;
+}
+
+/// [`Misskey::mentions_since`] の起点。この ID か時刻より後のものを返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Since {
+    Id(String),
+    Date(DateTime<Utc>),
+}
+
+/// メンションの受け口から届くもの。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    Mention(Note),
+    /// 切れていたストリーミングがつながり直した。切れていた間のメンションは届かないので、REST で取り直す。
+    Reconnected,
+}
+
+/// 自分へのメンションを順に受け取る。
+pub trait MentionSource {
+    /// 次のイベント。ストリームが閉じたら `None`。デコードできないイベントは `Err` を 1 件返して続く。
+    async fn recv(&mut self) -> Option<Result<Event, Error>>;
 }
 
 /// miapi で Misskey を叩く実装。
@@ -111,6 +155,17 @@ impl MiapiMisskey {
             user_id: me.id,
         })
     }
+
+    /// ストリーミングの `main` チャンネルにつなぎ、メンションの受け口を返す。
+    pub async fn mentions(&self) -> Result<MentionStream, Error> {
+        let stream = self.client.streaming().await?;
+        let connection = stream.main().await?;
+        info!("connected to the streaming main channel");
+        Ok(MentionStream {
+            connection,
+            state: stream.state(),
+        })
+    }
 }
 
 impl Misskey for MiapiMisskey {
@@ -120,7 +175,7 @@ impl Misskey for MiapiMisskey {
     }
 
     async fn create_note(&self, note: NewNote<'_>) -> Result<Note, Error> {
-        // `specified` は宛先（visibleUserIds）を送らない。
+        // `specified` は宛先（visibleUserIds）を送らない。返信なら Misskey が返信先のユーザーを宛先に足す。
         let visibility = match note.visibility {
             Visibility::Public => RequestVisibility::Public,
             Visibility::Home => RequestVisibility::Home,
@@ -133,8 +188,31 @@ impl Misskey for MiapiMisskey {
             .create()
             .visibility(visibility)
             .text(note.text)
+            .maybe_reply_id(note.reply_id)
             .await?;
         Ok(response.created_note.into())
+    }
+
+    async fn react(&self, note_id: &str, reaction: &str) -> Result<(), Error> {
+        self.client
+            .notes()
+            .reactions()
+            .create()
+            .note_id(note_id)
+            .reaction(reaction)
+            .await?;
+        Ok(())
+    }
+
+    async fn is_followed_by(&self, user_id: &str) -> Result<bool, Error> {
+        let response = self.client.users().show().user_id(user_id).await?;
+        Ok(match response {
+            UserShowResponse::UserDetailedNotMe(user) => user.is_followed.unwrap_or(false),
+            // 自分自身、複数指定の応答、知らない形は「フォローされていない」として扱う（旧版と同じく、不明なら無視する）。
+            UserShowResponse::MeDetailed(_)
+            | UserShowResponse::Array(_)
+            | UserShowResponse::Unrecognized(_) => false,
+        })
     }
 
     async fn local_timeline(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error> {
@@ -160,6 +238,16 @@ impl Misskey for MiapiMisskey {
         let call = match until {
             Until::Date(date) => call.until_date(date.timestamp_millis()),
             Until::Id(id) => call.until_id(id.as_str()),
+        };
+        Ok(call.await?.into_iter().map(Note::from).collect())
+    }
+
+    async fn mentions_since(&self, since: &Since, limit: u8) -> Result<Vec<Note>, Error> {
+        // `since_id` か `since_date` を渡すと、Misskey はそれより後のノートを古い順に返す。
+        let call = self.client.notes().mentions().limit(i64::from(limit));
+        let call = match since {
+            Since::Id(id) => call.since_id(id.as_str()),
+            Since::Date(date) => call.since_date(date.timestamp_millis()),
         };
         Ok(call.await?.into_iter().map(Note::from).collect())
     }
@@ -224,6 +312,46 @@ impl Misskey for MiapiMisskey {
     }
 }
 
+/// ストリーミングの `main` チャンネル。切れたら miapi がつなぎ直す。
+pub struct MentionStream {
+    connection: main::Connection,
+    state: tokio::sync::watch::Receiver<miapi::stream::State>,
+}
+
+impl MentionSource for MentionStream {
+    async fn recv(&mut self) -> Option<Result<Event, Error>> {
+        loop {
+            // 状態が変わって `Connected` なら、つなぎ直した後である。その接続のメンションより先に `Reconnected` を返すよう、
+            // 状態の変化を先に見る（miapi は `Connected` にしてからイベントを振り分ける。`Stream::state` の doc）。
+            let event = tokio::select! {
+                biased;
+                changed = self.state.changed() => {
+                    // 送り手が無くなったら、ストリームは閉じている。
+                    changed.ok()?;
+                    match &*self.state.borrow_and_update() {
+                        miapi::stream::State::Connected => {
+                            info!("the streaming connection is back");
+                            return Some(Ok(Event::Reconnected));
+                        }
+                        // トークンの失効などに気付くよう、つなぎ直しに失敗するたびに warn する。
+                        miapi::stream::State::Reconnecting { attempts, last_error } => {
+                            warn!(attempts, error = %last_error, "the streaming connection is down; reconnecting");
+                        }
+                        miapi::stream::State::Closed => {}
+                    }
+                    continue;
+                }
+                event = self.connection.recv() => event?,
+            };
+            match event {
+                Ok(main::Event::Mention(note)) => return Some(Ok(Event::Mention(note.into()))),
+                Ok(_) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+}
+
 impl From<types::EmojiSimple> for Emoji {
     fn from(emoji: types::EmojiSimple) -> Self {
         Self {
@@ -241,7 +369,14 @@ impl From<types::Note> for Note {
         Self {
             id: note.id,
             text: note.text.unwrap_or_default(),
+            cw: note.cw,
+            user: NoteUser {
+                id: note.user.id,
+                host: note.user.host,
+                is_bot: note.user.is_bot.unwrap_or(false),
+            },
             created_at: note.created_at,
+            is_specified: matches!(note.visibility, types::NoteVisibility::Specified),
             // Misskey の JSON の数は整数だが、spec の `number` は f64 になる。
             reactions: note
                 .reactions
@@ -255,12 +390,15 @@ impl From<types::Note> for Note {
 /// ジョブのテストで使う、メモリ上の Misskey。
 #[cfg(test)]
 pub mod fake {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::Mutex;
 
     use chrono::{DateTime, TimeDelta, Utc};
 
-    use super::{BannerFile, Emoji, Error, Misskey, NewNote, Note, Until};
+    use super::{
+        BannerFile, Emoji, Error, Event, MentionSource, Misskey, NewNote, Note, NoteUser, Since,
+        Until,
+    };
     use crate::config::Visibility;
     use crate::mfm::{MAX_NOTE_LENGTH, note_length};
 
@@ -269,6 +407,7 @@ pub mod fake {
     pub enum Fail {
         Emojis,
         Create,
+        React,
         Timeline,
         Upload,
         SetBanner,
@@ -276,6 +415,10 @@ pub mod fake {
         CreateInvalid,
         /// 投稿は保存したのに失敗を返す（応答の前に通信が切れた場合）。
         CreateStored,
+        /// メンションの取得を INTERNAL_ERROR（一時的な失敗）で失敗させる。
+        Mentions,
+        /// メンションの取得を INVALID_PARAM で拒む。
+        MentionsInvalid,
     }
 
     /// 作ったノート。
@@ -299,6 +442,10 @@ pub mod fake {
         created: Vec<Created>,
         /// ローカルタイムラインのノート。新しい順に並べて返す。
         timeline: Vec<Note>,
+        /// 送ったリアクション（ノート ID、絵文字）。
+        reactions: Vec<(String, String)>,
+        /// 自分をフォローしているユーザーの ID。
+        followers: HashSet<String>,
         files: Vec<File>,
         /// 次に上げるファイルの通し番号。削除しても ID は重ならない。
         next_file: u64,
@@ -314,6 +461,10 @@ pub mod fake {
         base_time: DateTime<Utc>,
         /// `local_timeline` が呼ばれた起点。
         timeline_queries: Vec<Until>,
+        /// `mentions_since` が返す、自分へのメンション。
+        mentions: Vec<Note>,
+        /// `mentions_since` が呼ばれた起点。
+        mention_queries: Vec<Since>,
     }
 
     #[derive(Debug, Default)]
@@ -321,11 +472,22 @@ pub mod fake {
         state: Mutex<State>,
     }
 
+    pub fn user(id: &str) -> NoteUser {
+        NoteUser {
+            id: id.to_owned(),
+            host: None,
+            is_bot: false,
+        }
+    }
+
     pub fn note(id: &str, text: &str, created_at: DateTime<Utc>) -> Note {
         Note {
             id: id.to_owned(),
             text: text.to_owned(),
+            cw: None,
+            user: user("u1"),
             created_at,
+            is_specified: false,
             reactions: HashMap::new(),
         }
     }
@@ -393,6 +555,25 @@ pub mod fake {
             self
         }
 
+        /// `mentions_since` で返すメンション。
+        pub fn with_mentions(self, notes: Vec<Note>) -> Self {
+            self.state.lock().unwrap().mentions = notes;
+            self
+        }
+
+        pub fn mention_queries(&self) -> Vec<Since> {
+            self.state.lock().unwrap().mention_queries.clone()
+        }
+
+        pub fn with_follower(self, user_id: &str) -> Self {
+            self.state
+                .lock()
+                .unwrap()
+                .followers
+                .insert(user_id.to_owned());
+            self
+        }
+
         /// 既にあるドライブのファイルをバナーにしておく。
         pub fn with_banner(self, file_id: &str, name: &str) -> Self {
             let mut state = self.state.lock().unwrap();
@@ -452,6 +633,10 @@ pub mod fake {
             self.created().into_iter().map(|c| c.note.text).collect()
         }
 
+        pub fn reactions(&self) -> Vec<(String, String)> {
+            self.state.lock().unwrap().reactions.clone()
+        }
+
         /// ドライブのファイルの名前。残っているものだけ。
         pub fn file_names(&self) -> Vec<String> {
             self.state
@@ -497,7 +682,10 @@ pub mod fake {
             let note = Note {
                 id: format!("note{}", self.next_id),
                 text: text.to_owned(),
+                cw: None,
+                user: user("me"),
                 created_at: self.base_time + TimeDelta::minutes(self.next_id as i64),
+                is_specified: visibility == Visibility::Specified,
                 reactions: HashMap::new(),
             };
             self.next_id += 1;
@@ -535,6 +723,21 @@ pub mod fake {
             Ok(created)
         }
 
+        async fn react(&self, note_id: &str, reaction: &str) -> Result<(), Error> {
+            let mut state = self.state.lock().unwrap();
+            if state.should_fail(Fail::React) {
+                return Err(api_error("notes/reactions/create", "INTERNAL_ERROR"));
+            }
+            state
+                .reactions
+                .push((note_id.to_owned(), reaction.to_owned()));
+            Ok(())
+        }
+
+        async fn is_followed_by(&self, user_id: &str) -> Result<bool, Error> {
+            Ok(self.state.lock().unwrap().followers.contains(user_id))
+        }
+
         async fn local_timeline(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error> {
             let mut state = self.state.lock().unwrap();
             if state.should_fail(Fail::Timeline) {
@@ -548,6 +751,30 @@ pub mod fake {
             let state = self.state.lock().unwrap();
             let notes = state.created.iter().map(|c| c.note.clone()).collect();
             Ok(before(notes, until, limit))
+        }
+
+        async fn mentions_since(&self, since: &Since, limit: u8) -> Result<Vec<Note>, Error> {
+            let mut state = self.state.lock().unwrap();
+            // 失敗した回の起点も残し、同じ起点で試し直したかを確かめられるようにする。
+            state.mention_queries.push(since.clone());
+            if state.should_fail(Fail::Mentions) {
+                return Err(api_error("notes/mentions", "INTERNAL_ERROR"));
+            }
+            if state.should_fail(Fail::MentionsInvalid) {
+                return Err(api_error("notes/mentions", "INVALID_PARAM"));
+            }
+            let mut notes: Vec<Note> = state
+                .mentions
+                .iter()
+                .filter(|note| match since {
+                    Since::Id(id) => note.id > *id,
+                    Since::Date(date) => note.created_at > *date,
+                })
+                .cloned()
+                .collect();
+            notes.sort_by(|a, b| a.id.cmp(&b.id));
+            notes.truncate(usize::from(limit));
+            Ok(notes)
         }
 
         async fn upload_file(
@@ -609,6 +836,15 @@ pub mod fake {
         }
     }
 
+    /// 決まったイベントを順に返す受け口。尽きたら `None`。
+    pub struct FakeMentions(pub VecDeque<Result<Event, Error>>);
+
+    impl MentionSource for FakeMentions {
+        async fn recv(&mut self) -> Option<Result<Event, Error>> {
+            self.0.pop_front()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -636,6 +872,7 @@ pub mod fake {
                 NewNote {
                     text,
                     visibility: Visibility::Home,
+                    reply_id: None,
                 }
             }
             // 🥇 は UTF-16 で 2 単位なので、1500 個で上限ちょうどになる。
@@ -735,11 +972,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_note_sends_visibility_and_text() {
+    async fn create_note_sends_visibility_text_and_reply_id() {
         let (server, misskey) = connected().await;
         Mock::given(path("/api/notes/create"))
             .and(body_json(
-                json!({"visibility": "specified", "text": "hello", "i": "tok"}),
+                json!({"visibility": "specified", "text": "hello", "replyId": "n0", "i": "tok"}),
             ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"createdNote": note_json()})),
@@ -751,10 +988,55 @@ mod tests {
             .create_note(NewNote {
                 text: "hello",
                 visibility: Visibility::Specified,
+                reply_id: Some("n0"),
             })
             .await
             .unwrap();
         assert_eq!(note.id, note_json()["id"].as_str().unwrap());
+        assert!(!note.user.is_bot);
+    }
+
+    #[tokio::test]
+    async fn react_sends_the_note_id_and_the_reaction() {
+        let (server, misskey) = connected().await;
+        Mock::given(path("/api/notes/reactions/create"))
+            .and(body_json(
+                json!({"noteId": "n1", "reaction": "❓", "i": "tok"}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        misskey.react("n1", "❓").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn is_followed_by_reads_the_flag_and_treats_other_shapes_as_false() {
+        let (server, misskey) = connected().await;
+        let mut user = me_json();
+        user["isFollowed"] = json!(true);
+        user["isFollowing"] = json!(false);
+        // MeDetailed にしか無いフィールドを外し、UserDetailedNotMe として読ませる。
+        for key in [
+            "email",
+            "emailVerified",
+            "hasUnreadAnnouncement",
+            "policies",
+        ] {
+            user.as_object_mut().unwrap().remove(key);
+        }
+        Mock::given(path("/api/users/show"))
+            .and(body_json(json!({"userId": "u1", "i": "tok"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(user))
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/users/show"))
+            .and(body_json(json!({"userId": "me", "i": "tok"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(me_json()))
+            .mount(&server)
+            .await;
+        assert!(misskey.is_followed_by("u1").await.unwrap());
+        assert!(!misskey.is_followed_by("me").await.unwrap());
     }
 
     #[tokio::test]
@@ -775,6 +1057,40 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].reactions[":a@.:"], 3);
         assert_eq!(notes[0].reactions["👍"], 1);
+    }
+
+    #[tokio::test]
+    async fn mentions_since_queries_by_id_or_date() {
+        let (server, misskey) = connected().await;
+        Mock::given(path("/api/notes/mentions"))
+            .and(body_json(
+                json!({"limit": 100, "sinceId": "n1", "i": "tok"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([note_json()])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/notes/mentions"))
+            .and(body_json(
+                json!({"limit": 100, "sinceDate": 1700000000000i64, "i": "tok"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let by_id = misskey
+            .mentions_since(&Since::Id("n1".to_owned()), 100)
+            .await
+            .unwrap();
+        assert_eq!(by_id.len(), 1);
+        let by_date = misskey
+            .mentions_since(
+                &Since::Date(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(by_date.is_empty());
     }
 
     #[tokio::test]
@@ -895,9 +1211,11 @@ mod tests {
             .create_note(NewNote {
                 text: &text,
                 visibility: Visibility::Specified,
+                reply_id: None,
             })
             .await
             .unwrap();
+        misskey.react(&note.id, "👍").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let mine = misskey
             .my_notes(&Until::Date(Utc::now()), 10)
@@ -923,5 +1241,8 @@ mod tests {
         if let Some(previous) = previous {
             misskey.set_banner(Some(&previous.id)).await.unwrap();
         }
+
+        // ストリーミングの upgrade が通ること。
+        let _mentions = misskey.mentions().await.unwrap();
     }
 }

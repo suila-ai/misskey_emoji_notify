@@ -135,6 +135,19 @@ impl EmojiSet {
             emoji.image = image;
         }
     }
+
+    /// `categories` のどれかに入る絵文字。`categories` が空なら全部。
+    pub fn in_categories<'a>(&'a self, categories: &'a [String]) -> Vec<&'a StoredEmoji> {
+        self.iter()
+            .filter(|emoji| {
+                categories.is_empty()
+                    || emoji
+                        .category
+                        .as_ref()
+                        .is_some_and(|category| categories.contains(category))
+            })
+            .collect()
+    }
 }
 
 /// 前回との差分。
@@ -372,6 +385,18 @@ mod tests {
         let empty = EmojiSet::default();
         let changes = diff(&empty, &new);
         assert_eq!(names(changes.added.iter().copied()), ["a"]);
+    }
+
+    #[test]
+    fn categories_filter_and_empty_means_all() {
+        let set = EmojiSet::from_stored([
+            stored("a", Some("c1"), &[], "u1"),
+            stored("b", Some("c2"), &[], "u2"),
+            stored("c", None, &[], "u3"),
+        ]);
+        assert_eq!(names(set.in_categories(&[])), ["a", "b", "c"]);
+        assert_eq!(names(set.in_categories(&["c2".to_owned()])), ["b"]);
+        assert!(set.in_categories(&["none".to_owned()]).is_empty());
     }
 
     #[test]
