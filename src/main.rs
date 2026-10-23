@@ -1,7 +1,8 @@
 //! Misskey のカスタム絵文字の変更を通知する bot。
 //!
-//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿する。
+//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿し、全絵文字を並べたバナーを作る。
 
+mod banner;
 mod config;
 mod emoji;
 mod images;
@@ -87,7 +88,7 @@ async fn run() -> Result<(), Error> {
             emoji_set.clone(),
         ))
     } else {
-        info!("no notify is configured; the emoji check will not run");
+        info!("no notify or banner is configured; the emoji check will not run");
         None
     };
 

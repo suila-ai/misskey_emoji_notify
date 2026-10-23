@@ -255,6 +255,11 @@ pub fn remove_unreferenced(dir: &Path, set: &EmojiSet) {
     }
 }
 
+/// `emoji` の画像ファイルのパス。画像を取っていなければ `None`。
+pub fn image_path(dir: &Path, emoji: &StoredEmoji) -> Option<PathBuf> {
+    Some(dir.join(emoji.image_file()?))
+}
+
 /// SHA-1 の 16 進。
 pub fn sha1_hex(data: &[u8]) -> String {
     Sha1::digest(data)
@@ -522,7 +527,7 @@ mod tests {
         assert!(dir.join("keep.png").exists());
         assert!(!dir.join("drop.png").exists());
         assert_eq!(
-            dir.path().join(set.get("a").unwrap().image_file().unwrap()),
+            image_path(dir.path(), set.get("a").unwrap()).unwrap(),
             dir.join("keep.png")
         );
     }

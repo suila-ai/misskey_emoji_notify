@@ -1,7 +1,7 @@
 //! TOML の設定ファイル。起動時に 1 回だけ読む。
 //!
-//! 設定は、それが効くものごとの節に置く。`[emoji]` は絵文字一覧の確認（`state_dir` と `cron`）で、その一覧から作る通知を
-//! `[emoji.notify]` に書く。`[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
+//! 設定は、それが効くものごとの節に置く。`[emoji]` は絵文字一覧の確認（`state_dir` と `cron`）で、その一覧から作る通知と
+//! バナーを `[emoji.notify]` と `[emoji.banner]` に書く。`[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -20,12 +20,12 @@ const DEFAULT_CHECK_CRON: &str = "0 */10 * * * *";
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub misskey: MisskeyConfig,
-    /// 絵文字一覧の確認と、その一覧から作る通知。
+    /// 絵文字一覧の確認と、その一覧から作る通知とバナー。
     #[serde(default)]
     pub emoji: EmojiConfig,
 }
 
-/// 絵文字一覧の確認。通知を使うときに動く。
+/// 絵文字一覧の確認。通知かバナーを使うときに動く。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmojiConfig {
@@ -36,6 +36,8 @@ pub struct EmojiConfig {
     pub cron: Cron,
     /// 絵文字の変更の通知。
     pub notify: Option<NotifyConfig>,
+    /// バナーの更新。
+    pub banner: Option<BannerConfig>,
 }
 
 impl Default for EmojiConfig {
@@ -44,6 +46,7 @@ impl Default for EmojiConfig {
             state_dir: PathBuf::from("state"),
             cron: default_check_cron(),
             notify: None,
+            banner: None,
         }
     }
 }
@@ -54,7 +57,7 @@ impl Default for EmojiConfig {
 pub struct MisskeyConfig {
     /// サーバのベース URL。
     pub server: Url,
-    /// アクセストークン。`read:account`、`write:notes` の権限が要る。
+    /// アクセストークン。`read:account`、`write:account`、`read:drive`、`write:drive`、`write:notes` の権限が要る。
     pub token: String,
 }
 
@@ -65,6 +68,11 @@ pub struct NotifyConfig {
     #[serde(default)]
     pub visibility: Visibility,
 }
+
+/// 項目は無い。節の有無だけを見る。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BannerConfig {}
 
 /// ノートの公開範囲。設定には小文字で書く。
 ///
@@ -127,9 +135,9 @@ impl Config {
         Ok(config)
     }
 
-    /// 絵文字の一覧を確かめるジョブが要るか。通知があるとき。
+    /// 絵文字の一覧を確かめるジョブが要るか。通知かバナーがあるとき。
     pub fn needs_emoji_check(&self) -> bool {
-        self.emoji.notify.is_some()
+        self.emoji.notify.is_some() || self.emoji.banner.is_some()
     }
 }
 
@@ -193,6 +201,7 @@ token = "token"
         assert_eq!(config.emoji.state_dir, PathBuf::from("state"));
         assert_eq!(config.emoji.cron, parse_cron(DEFAULT_CHECK_CRON).unwrap());
         assert!(config.emoji.notify.is_none());
+        assert!(config.emoji.banner.is_none());
         assert!(!config.needs_emoji_check());
     }
 
@@ -207,6 +216,7 @@ cron = "*/5 * * * *"
 [emoji.notify]
 visibility = "specified"
 
+[emoji.banner]
 "#
         );
         let config = parse(&text).unwrap();
@@ -216,12 +226,15 @@ visibility = "specified"
             config.emoji.notify.unwrap().visibility,
             Visibility::Specified
         );
+        assert!(config.emoji.banner.is_some());
     }
 
     #[test]
     fn the_emoji_check_runs_when_any_consumer_is_configured() {
         let notify_only = parse(&format!("{MINIMAL}\n[emoji.notify]\n")).unwrap();
         assert!(notify_only.needs_emoji_check());
+        let banner_only = parse(&format!("{MINIMAL}\n[emoji.banner]\n")).unwrap();
+        assert!(banner_only.needs_emoji_check());
         // [emoji] は確認の設定だけで、機能の節ではない。
         let settings_only = parse(&format!("{MINIMAL}\n[emoji]\nstate_dir = \"x\"\n")).unwrap();
         assert!(!settings_only.needs_emoji_check());
@@ -274,7 +287,7 @@ visibility = "specified"
     #[test]
     fn the_example_config_is_valid() {
         let config = parse(include_str!("../config.example.toml")).unwrap();
-        assert!(config.emoji.notify.is_some());
+        assert!(config.emoji.notify.is_some() && config.emoji.banner.is_some());
     }
 
     #[test]

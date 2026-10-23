@@ -33,11 +33,30 @@ pub struct NewNote<'a> {
     pub visibility: Visibility,
 }
 
+/// プロフィールのバナーに使っているドライブのファイル。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BannerFile {
+    pub id: String,
+    pub name: String,
+}
+
 /// bot が Misskey に対して行う操作。
 pub trait Misskey {
     /// ローカルのカスタム絵文字の一覧。
     async fn emojis(&self) -> Result<Vec<Emoji>, Error>;
     async fn create_note(&self, note: NewNote<'_>) -> Result<Note, Error>;
+    /// ドライブにファイルを上げ、その ID を返す。中身が既存のファイルと同じでも、新しいファイルにする。
+    async fn upload_file(
+        &self,
+        name: &str,
+        content_type: &str,
+        data: Vec<u8>,
+    ) -> Result<String, Error>;
+    /// 今のバナーのファイル。設定していないか、ファイルが消えていれば `None`。
+    async fn current_banner(&self) -> Result<Option<BannerFile>, Error>;
+    /// `file_id` のファイルをバナーにする。`None` ならバナーを外す。
+    async fn set_banner(&self, file_id: Option<&str>) -> Result<(), Error>;
+    async fn delete_file(&self, file_id: &str) -> Result<(), Error>;
 }
 
 /// miapi で Misskey を叩く実装。
@@ -81,6 +100,65 @@ impl Misskey for MiapiMisskey {
             .await?;
         Ok(response.created_note.into())
     }
+
+    async fn upload_file(
+        &self,
+        name: &str,
+        content_type: &str,
+        data: Vec<u8>,
+    ) -> Result<String, Error> {
+        // force を付けないと、Misskey は同じ中身（md5）の既存ファイルを返す。前のバナーと同じ ID が返ると、
+        // 前のバナーとして消してしまう。
+        let file = self
+            .client
+            .drive()
+            .files()
+            .create()
+            .name(name)
+            .force(true)
+            .file(miapi::FilePart {
+                file_name: name.to_owned(),
+                content_type: Some(content_type.to_owned()),
+                data,
+            })
+            .await?;
+        Ok(file.id)
+    }
+
+    async fn current_banner(&self) -> Result<Option<BannerFile>, Error> {
+        let me = self.client.i().await?;
+        let Some(id) = me.banner_id else {
+            return Ok(None);
+        };
+        match self.client.drive().files().show().file_id(&id).await {
+            Ok(file) => Ok(Some(BannerFile {
+                id: file.id,
+                name: file.name,
+            })),
+            Err(Error::Api(error)) if error.code == "NO_SUCH_FILE" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn set_banner(&self, file_id: Option<&str>) -> Result<(), Error> {
+        let update = self.client.i().update();
+        match file_id {
+            Some(file_id) => update.banner_id(file_id),
+            None => update.banner_id_null(),
+        }
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_file(&self, file_id: &str) -> Result<(), Error> {
+        self.client
+            .drive()
+            .files()
+            .delete()
+            .file_id(file_id)
+            .await?;
+        Ok(())
+    }
 }
 
 impl From<types::EmojiSimple> for Emoji {
@@ -106,7 +184,7 @@ impl From<types::Note> for Note {
 pub mod fake {
     use std::sync::Mutex;
 
-    use super::{Emoji, Error, Misskey, NewNote, Note};
+    use super::{BannerFile, Emoji, Error, Misskey, NewNote, Note};
     use crate::config::Visibility;
     use crate::mfm::{MAX_NOTE_LENGTH, note_length};
 
@@ -115,6 +193,8 @@ pub mod fake {
     pub enum Fail {
         Emojis,
         Create,
+        Upload,
+        SetBanner,
         /// 投稿を INVALID_PARAM で拒む。
         CreateInvalid,
         /// 投稿は保存したのに失敗を返す（応答の前に通信が切れた場合）。
@@ -128,11 +208,24 @@ pub mod fake {
         pub visibility: Visibility,
     }
 
+    /// ドライブのファイル。
+    #[derive(Debug, Clone)]
+    struct File {
+        id: String,
+        name: String,
+    }
+
     #[derive(Debug, Default)]
     struct State {
         emojis: Vec<Emoji>,
         /// 自分が作ったノート。作成順。
         created: Vec<Created>,
+        files: Vec<File>,
+        /// 次に上げるファイルの通し番号。削除しても ID は重ならない。
+        next_file: u64,
+        /// `upload_file` が呼ばれた回数。
+        uploads: usize,
+        banner_id: Option<String>,
         next_id: u64,
         fail: Option<Fail>,
         /// 応答を返さずに止まる操作。
@@ -176,6 +269,18 @@ pub mod fake {
             self.state.lock().unwrap().emojis = emojis;
         }
 
+        /// 既にあるドライブのファイルをバナーにしておく。
+        pub fn with_banner(self, file_id: &str, name: &str) -> Self {
+            let mut state = self.state.lock().unwrap();
+            state.files.push(File {
+                id: file_id.to_owned(),
+                name: name.to_owned(),
+            });
+            state.banner_id = Some(file_id.to_owned());
+            drop(state);
+            self
+        }
+
         /// 指定した操作を失敗させる。
         pub fn failing(self, fail: Fail) -> Self {
             self.state.lock().unwrap().fail = Some(fail);
@@ -206,6 +311,26 @@ pub mod fake {
         /// 作ったノートの本文。作成順。
         pub fn texts(&self) -> Vec<String> {
             self.created().into_iter().map(|c| c.text).collect()
+        }
+
+        /// ドライブのファイルの名前。残っているものだけ。
+        pub fn file_names(&self) -> Vec<String> {
+            self.state
+                .lock()
+                .unwrap()
+                .files
+                .iter()
+                .map(|file| file.name.clone())
+                .collect()
+        }
+
+        /// `upload_file` が呼ばれた回数。
+        pub fn uploads(&self) -> usize {
+            self.state.lock().unwrap().uploads
+        }
+
+        pub fn banner_id(&self) -> Option<String> {
+            self.state.lock().unwrap().banner_id.clone()
         }
     }
 
@@ -253,11 +378,85 @@ pub mod fake {
             }
             Ok(created)
         }
+
+        async fn upload_file(
+            &self,
+            name: &str,
+            _content_type: &str,
+            _data: Vec<u8>,
+        ) -> Result<String, Error> {
+            let mut state = self.state.lock().unwrap();
+            state.uploads += 1;
+            if state.should_fail(Fail::Upload) {
+                return Err(api_error("drive/files/create", "INTERNAL_ERROR"));
+            }
+            let id = format!("file{}", state.next_file);
+            state.next_file += 1;
+            state.files.push(File {
+                id: id.clone(),
+                name: name.to_owned(),
+            });
+            Ok(id)
+        }
+
+        async fn current_banner(&self) -> Result<Option<BannerFile>, Error> {
+            let state = self.state.lock().unwrap();
+            Ok(state.banner_id.as_ref().and_then(|id| {
+                state
+                    .files
+                    .iter()
+                    .find(|file| &file.id == id)
+                    .map(|file| BannerFile {
+                        id: file.id.clone(),
+                        name: file.name.clone(),
+                    })
+            }))
+        }
+
+        async fn set_banner(&self, file_id: Option<&str>) -> Result<(), Error> {
+            let mut state = self.state.lock().unwrap();
+            if state.should_fail(Fail::SetBanner) {
+                return Err(api_error("i/update", "INTERNAL_ERROR"));
+            }
+            if let Some(file_id) = file_id
+                && !state.files.iter().any(|file| file.id == file_id)
+            {
+                return Err(api_error("i/update", "NO_SUCH_FILE"));
+            }
+            state.banner_id = file_id.map(str::to_owned);
+            Ok(())
+        }
+
+        async fn delete_file(&self, file_id: &str) -> Result<(), Error> {
+            let mut state = self.state.lock().unwrap();
+            let before = state.files.len();
+            state.files.retain(|file| file.id != file_id);
+            if state.files.len() == before {
+                return Err(api_error("drive/files/delete", "NO_SUCH_FILE"));
+            }
+            Ok(())
+        }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn file_ids_are_not_reused_after_a_delete() {
+            let misskey = FakeMisskey::new();
+            let first = misskey
+                .upload_file("a", "image/png", vec![1])
+                .await
+                .unwrap();
+            misskey.delete_file(&first).await.unwrap();
+            let second = misskey
+                .upload_file("b", "image/png", vec![2])
+                .await
+                .unwrap();
+            assert_ne!(first, second);
+            assert_eq!(misskey.uploads(), 2);
+        }
 
         #[tokio::test]
         async fn a_note_over_the_length_limit_is_rejected() {
@@ -281,7 +480,7 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
-    use wiremock::matchers::{body_json, path};
+    use wiremock::matchers::{body_json, body_string_contains, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use chrono::Utc;
@@ -388,6 +587,70 @@ mod tests {
         assert_eq!(note.id, note_json()["id"].as_str().unwrap());
     }
 
+    #[tokio::test]
+    async fn the_banner_is_read_and_replaced_through_the_drive() {
+        let (server, misskey) = connected().await;
+        let file = json!({
+            "id": "as4pl7zxsexx000c", "createdAt": "2026-10-09T15:53:11.194Z", "name": "banner_1.png", "type": "image/png",
+            "md5": "d41d8cd98f00b204e9800998ecf8427e", "size": 1, "isSensitive": false, "blurhash": null,
+            "properties": {}, "url": "https://misskey.example.com/files/x", "thumbnailUrl": null, "comment": null,
+            "folderId": null, "folder": null, "userId": null, "user": null
+        });
+        Mock::given(path("/api/drive/files/show"))
+            .and(body_json(json!({"fileId": "as4pl7zxsexx000c", "i": "tok"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(file.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/drive/files/create"))
+            .and(body_string_contains("name=\"force\"\r\n\r\ntrue\r\n"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(file))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/i/update"))
+            .and(body_json(
+                json!({"bannerId": "as4pl7zxsexx000c", "i": "tok"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(me_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/i/update"))
+            .and(body_json(json!({"bannerId": null, "i": "tok"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(me_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/drive/files/delete"))
+            .and(body_json(json!({"fileId": "old", "i": "tok"})))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let banner = misskey.current_banner().await.unwrap().unwrap();
+        assert_eq!(banner.name, "banner_1.png");
+        let id = misskey
+            .upload_file("banner_2.png", "image/png", vec![1, 2, 3])
+            .await
+            .unwrap();
+        misskey.set_banner(Some(&id)).await.unwrap();
+        misskey.set_banner(None).await.unwrap();
+        misskey.delete_file("old").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_banner_file_is_none() {
+        let (server, misskey) = connected().await;
+        Mock::given(path("/api/drive/files/show"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "No such file.", "code": "NO_SUCH_FILE", "id": "067bc436-2718-4795-b0fb-ecbe43949e31"}
+            })))
+            .mount(&server)
+            .await;
+        assert_eq!(misskey.current_banner().await.unwrap(), None);
+    }
+
     /// 実サーバに対する往復。`scripts/misskey/up.sh` で立てたローカル Misskey に向けて手で実行する。
     #[tokio::test]
     #[ignore = "needs a live server: set MISSKEY_SERVER and MISSKEY_TOKEN (see scripts/misskey/up.sh)"]
@@ -411,5 +674,19 @@ mod tests {
             })
             .await
             .unwrap();
+
+        let previous = misskey.current_banner().await.unwrap();
+        let png = include_bytes!("../tests/fixtures/images/red.png").to_vec();
+        let id = misskey
+            .upload_file("banner_live.png", "image/png", png)
+            .await
+            .unwrap();
+        misskey.set_banner(Some(&id)).await.unwrap();
+        let banner = misskey.current_banner().await.unwrap().unwrap();
+        assert_eq!(banner.id, id);
+        misskey.delete_file(&id).await.unwrap();
+        if let Some(previous) = previous {
+            misskey.set_banner(Some(&previous.id)).await.unwrap();
+        }
     }
 }

@@ -1,6 +1,6 @@
-//! 絵文字一覧を確かめ、状態を保存してから、前回との差分を投稿するジョブ。
+//! 絵文字一覧を確かめ、状態を保存してから、前回との差分を投稿し、バナーを一覧に合わせるジョブ。
 //!
-//! 前回の状態（共有の [`EmojiSet`]）が無ければ初回とみなし、保存するだけで投稿しない。
+//! 前回の状態（共有の [`EmojiSet`]）が無ければ初回とみなし、保存するだけで投稿しない。バナーは初回から作る。
 //! 空の一覧が返ったら（前回も空のときを除く）、サーバの不調かもしれないので 1 回だけ見送り、続いたら受け入れる。
 //! 初回も見送らないと、一時的な空の一覧を控えて、次の回に全絵文字を追加として投稿する。
 //! 重複投稿より取りこぼしを選ぶ。状態は投稿の前に保存し、保存に失敗したら投稿せずに次の回で同じ差分を試す。
@@ -8,8 +8,8 @@
 //! 同じ変更を次回また投稿はしない。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, error, info, warn};
 
@@ -18,8 +18,40 @@ use crate::SharedEmojiSet;
 use crate::config::{EmojiConfig, Visibility};
 use crate::emoji::{self, EmojiSet, diff};
 use crate::images::{self, ImageFetcher};
-use crate::misskey::{Misskey, NewNote};
-use crate::{mfm, state};
+use crate::misskey::{BannerFile, Misskey, NewNote};
+use crate::{banner, mfm, state};
+
+/// bot が上げたバナーのファイル名の接頭辞。
+const BANNER_PREFIX: &str = "banner_";
+/// バナーのファイル名に入れる指紋の桁数（16 進）。
+const FINGERPRINT_LEN: usize = 16;
+/// バナーの指紋の版。並べ方を変えたら上げて、どのサーバでも 1 回作り直させる。
+const BANNER_VERSION: &str = "v3";
+
+/// `set` から作るバナーのファイル名。画像のある絵文字の SHA-1 を名前の順に並べた指紋を含むので、
+/// 今のバナーの名前と比べれば、バナーが一覧に合っているかが分かる。
+fn banner_name(set: &EmojiSet) -> String {
+    let mut fingerprint = String::from(BANNER_VERSION);
+    for image in set.iter().filter_map(|emoji| emoji.image.as_ref()) {
+        fingerprint.push('\n');
+        fingerprint.push_str(&image.sha1);
+    }
+    let fingerprint = images::sha1_hex(fingerprint.as_bytes());
+    format!("{BANNER_PREFIX}{}.png", &fingerprint[..FINGERPRINT_LEN])
+}
+
+/// bot が上げたバナーの名前か。[`banner_name`] の形（接頭辞、指紋の小文字の 16 進、`.png`）のものだけを bot のものとみなし、
+/// 所有者が手で上げた `banner_*.png` は消さない。
+fn is_bot_banner(name: &str) -> bool {
+    name.strip_prefix(BANNER_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".png"))
+        .is_some_and(|fingerprint| {
+            fingerprint.len() == FINGERPRINT_LEN
+                && fingerprint
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
 
 /// [`EmojiCheckJob::commit`] の本体。保存できたら共有の一覧を差し替え、`image_dir` があれば参照されない画像を消す。
 fn save_and_swap(
@@ -27,14 +59,14 @@ fn save_and_swap(
     shared: &SharedEmojiSet,
     image_dir: Option<&Path>,
     set: EmojiSet,
-) -> Result<(), Error> {
+) -> Result<Arc<EmojiSet>, Error> {
     state::save(state_file, &set.iter().collect::<Vec<_>>())?;
     let set = Arc::new(set);
     *shared.write().expect("the emoji set lock is not poisoned") = Some(set.clone());
     if let Some(dir) = image_dir {
         images::remove_unreferenced(dir, &set);
     }
-    Ok(())
+    Ok(set)
 }
 
 /// 今の span の中で、`f` を別スレッドで動かす。
@@ -50,11 +82,14 @@ pub struct EmojiCheckJob<'a, M, F> {
     fetcher: F,
     /// 通知の公開範囲。通知しないなら `None`。
     notify: Option<Visibility>,
+    update_banner: bool,
     state_file: PathBuf,
     image_dir: PathBuf,
     shared: SharedEmojiSet,
     /// 直前の回で、空の一覧を見送ったか。
     skipped_empty: AtomicBool,
+    /// デコードできる画像が 1 つも無くて作れなかったバナーの名前。一覧が変わって名前が変わるまで作り直さない。
+    unbuildable_banner: Mutex<Option<String>>,
 }
 
 impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
@@ -63,16 +98,18 @@ impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
             misskey,
             fetcher,
             notify: config.notify.as_ref().map(|notify| notify.visibility),
+            update_banner: config.banner.is_some(),
             state_file: emoji::state_file(&config.state_dir),
             image_dir: images::image_dir(&config.state_dir),
             shared,
             skipped_empty: AtomicBool::new(false),
+            unbuildable_banner: Mutex::new(None),
         }
     }
 
-    /// 絵文字の画像が要るか。通知（画像変更の検知）のとき。
+    /// 絵文字の画像が要るか。通知（画像変更の検知）とバナーのとき。
     fn fetch_images(&self) -> bool {
-        self.notify.is_some()
+        self.notify.is_some() || self.update_banner
     }
 
     /// 前回の一覧。初回は `None`。
@@ -88,7 +125,7 @@ impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
     /// ファイルの読み書きは別スレッドで行う。保存と差し替えを別々に待つと、その間で timeout が掛かったときに、
     /// 保存したのに差し替えず、次の回に同じ差分をまた投稿しうる。そこで 1 つのクロージャにまとめる。
     /// 待っている間に timeout で止まっても、クロージャは最後まで動く。
-    async fn commit(&self, set: EmojiSet) -> Result<(), Error> {
+    async fn commit(&self, set: EmojiSet) -> Result<Arc<EmojiSet>, Error> {
         let state_file = self.state_file.clone();
         let shared = self.shared.clone();
         let image_dir = self.fetch_images().then(|| self.image_dir.clone());
@@ -98,8 +135,8 @@ impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
         .await?
     }
 
-    /// `old` から `new` への差分を、状態を保存してから投稿する。
-    async fn post_diff(&self, old: &EmojiSet, new: EmojiSet) -> Result<(), Error> {
+    /// `old` から `new` への差分を、状態を保存してから投稿する。保存した一覧を返す。
+    async fn post_diff(&self, old: &EmojiSet, new: EmojiSet) -> Result<Arc<EmojiSet>, Error> {
         // 差分は `new` を借りるので、保存して手放す前に本文を組み立てておく。
         let posts = {
             let changes = diff(old, &new);
@@ -119,11 +156,11 @@ impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
             self.notify
                 .map(|visibility| (visibility, mfm::emoji::render(&changes)))
         };
-        self.commit(new).await?;
+        let saved = self.commit(new).await?;
         if let Some((visibility, texts)) = posts {
             self.post_changes(visibility, &texts).await;
         }
-        Ok(())
+        Ok(saved)
     }
 
     async fn post_changes(&self, visibility: Visibility, texts: &[String]) {
@@ -134,6 +171,104 @@ impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
                     error!(error = %crate::error_chain(&error), length = mfm::note_length(text), "failed to post a change; it will not be retried")
                 }
             }
+        }
+    }
+
+    /// バナーを今の絵文字一覧に合わせる。今のバナーの名前が一覧から決まる名前と違えば作り直す。
+    /// 初回、絵文字の増減や画像の変更、誰かがバナーを差し替えたり消したりしたときに作り直すことになる。
+    /// 一覧が空なら、消えた絵文字を並べたまま残さないよう bot のバナーを外す。所有者のバナーは残す。
+    /// デコードできる画像が 1 つも無くて作れなかった一覧は、変わるまで作り直さない（確認のたびに全画像を読んで warn を重ねないため）。
+    /// 失敗は warn で済ませ、次の回にまた試す。
+    async fn keep_banner(&self, set: Arc<EmojiSet>) {
+        let current = match self.misskey.current_banner().await {
+            Ok(current) => current,
+            Err(error) => {
+                warn!(error = %crate::error_chain(&error), "failed to read the current banner");
+                return;
+            }
+        };
+        if set.is_empty() {
+            if let Some(current) = current.filter(|current| is_bot_banner(&current.name)) {
+                self.remove_banner(current).await;
+            }
+            return;
+        }
+        let name = banner_name(&set);
+        if current.as_ref().is_some_and(|current| current.name == name) {
+            debug!(name, "the banner matches the emoji list");
+            return;
+        }
+        if self
+            .unbuildable_banner
+            .lock()
+            .expect("the banner lock is not poisoned")
+            .as_deref()
+            == Some(name.as_str())
+        {
+            debug!(name, "the banner cannot be built from this emoji list");
+            return;
+        }
+        let dir = self.image_dir.clone();
+        let built = spawn_blocking_in_span(move || {
+            let paths: Vec<PathBuf> = set
+                .iter()
+                .filter_map(|emoji| images::image_path(&dir, emoji))
+                .collect();
+            banner::build(&paths)
+        });
+        let png = match built.await {
+            Ok(Some(png)) => png,
+            Ok(None) => {
+                warn!("no emoji image could be used; the banner is left as it is");
+                *self
+                    .unbuildable_banner
+                    .lock()
+                    .expect("the banner lock is not poisoned") = Some(name);
+                return;
+            }
+            Err(error) => {
+                warn!(error = %error, "building the banner panicked; the banner is left as it is");
+                return;
+            }
+        };
+        if let Err(error) = self.upload_banner(&name, png, current).await {
+            warn!(error = %crate::error_chain(&error), "failed to replace the banner");
+        }
+    }
+
+    /// `png` を `name` で上げてバナーにし、bot が上げた前のバナー（`previous`）を消す。
+    async fn upload_banner(
+        &self,
+        name: &str,
+        png: Vec<u8>,
+        previous: Option<BannerFile>,
+    ) -> Result<(), crate::misskey::Error> {
+        let file_id = self.misskey.upload_file(name, "image/png", png).await?;
+        if let Err(error) = self.misskey.set_banner(Some(&file_id)).await {
+            if let Err(error) = self.misskey.delete_file(&file_id).await {
+                warn!(file_id, error = %crate::error_chain(&error), "failed to delete the banner that could not be set");
+            }
+            return Err(error);
+        }
+        info!(file_id, "banner replaced");
+        if let Some(previous) = previous
+            && is_bot_banner(&previous.name)
+            && let Err(error) = self.misskey.delete_file(&previous.id).await
+        {
+            warn!(file_id = %previous.id, error = %crate::error_chain(&error), "failed to delete the previous banner");
+        }
+        Ok(())
+    }
+
+    /// bot のバナー `current` を外して消す。失敗は warn で済ませ、次の回にまた試す。
+    async fn remove_banner(&self, current: BannerFile) {
+        if let Err(error) = self.misskey.set_banner(None).await {
+            warn!(error = %crate::error_chain(&error), "failed to remove the banner");
+            return;
+        }
+        info!(file_id = %current.id, "banner removed as no emoji is left");
+        if let Err(error) = self.misskey.delete_file(&current.id).await {
+            warn!(file_id = %current.id, error = %crate::error_chain(&error), "failed to delete the removed banner");
         }
     }
 }
@@ -165,17 +300,23 @@ impl<M: Misskey, F: ImageFetcher> Job for EmojiCheckJob<'_, M, F> {
             let previous = old.clone().unwrap_or_default();
             images::sync(&self.fetcher, &previous, &mut new, &self.image_dir).await;
         }
-        match old {
+        let saved = match old {
             None => {
                 info!(
                     emojis = new.len(),
                     "took the first snapshot; nothing is posted"
                 );
-                self.commit(new).await?;
+                self.commit(new).await?
             }
             // 変わっていなければ、保存も投稿もしない。
-            Some(old) if *old == new => debug!("no change"),
+            Some(old) if *old == new => {
+                debug!("no change");
+                old
+            }
             Some(old) => self.post_diff(&old, new).await?,
+        };
+        if self.update_banner {
+            self.keep_banner(saved).await;
         }
         Ok(())
     }
@@ -191,6 +332,7 @@ mod tests {
     use crate::state::test_support::TempDir;
 
     const PNG: &[u8] = include_bytes!("../../tests/fixtures/images/red.png");
+    const BLUE: &[u8] = include_bytes!("../../tests/fixtures/images/blue.png");
 
     fn emoji(name: &str, category: Option<&str>, aliases: &[&str], url: &str) -> Emoji {
         Emoji {
@@ -223,18 +365,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_first_run_posts_nothing() {
+    async fn the_first_run_posts_nothing_and_makes_the_banner() {
         let dir = TempDir::new();
         let misskey = FakeMisskey::new().with_emojis(vec![emoji("a", None, &[], "u-a")]);
         let shared = shared();
         let job = EmojiCheckJob::new(
             &misskey,
             fetcher(),
-            &config(&dir, "[emoji.notify]\n"),
+            &config(&dir, "[emoji.notify]\n[emoji.banner]\n"),
             shared.clone(),
         );
         job.run().await.unwrap();
         assert!(misskey.texts().is_empty());
+        assert!(misskey.current_banner().await.unwrap().is_some());
+        assert_eq!(misskey.uploads(), 1);
         let saved: Vec<emoji::StoredEmoji> =
             state::load(&dir.join("emojis.json")).unwrap().unwrap();
         assert_eq!(saved.len(), 1);
@@ -251,14 +395,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_second_run_posts_the_changes() {
+    async fn the_second_run_posts_the_changes_and_replaces_the_banner() {
         let dir = TempDir::new();
-        let misskey = FakeMisskey::new().with_emojis(vec![
-            emoji("a", Some("c"), &["x"], "u-a"),
-            emoji("b", None, &[], "u-b"),
-        ]);
+        let misskey = FakeMisskey::new()
+            .with_emojis(vec![
+                emoji("a", Some("c"), &["x"], "u-a"),
+                emoji("b", None, &[], "u-b"),
+            ])
+            .with_banner("old-banner", "banner_0123456789abcdef.png");
         let shared = shared();
-        let config = config(&dir, "[emoji.notify]\nvisibility = \"public\"\n");
+        let config = config(
+            &dir,
+            "[emoji.notify]\nvisibility = \"public\"\n[emoji.banner]\n",
+        );
         let job = EmojiCheckJob::new(&misskey, fetcher(), &config, shared.clone());
         job.run().await.unwrap();
 
@@ -287,6 +436,11 @@ mod tests {
             "【タグ変更】\n$[x2 :a:] `:a:`\n追加: <plain>y</plain>\n"
         );
         assert!(created.iter().all(|c| c.visibility == Visibility::Public));
+        // バナーは新しいファイルになり、前のものは消える。
+        let banner = misskey.banner_id().unwrap();
+        assert_ne!(banner, "old-banner");
+        assert_eq!(misskey.file_names().len(), 1);
+        assert!(misskey.file_names()[0].starts_with("banner_"));
         // 状態は新しい一覧になり、消えた絵文字の画像ファイルは残らない。
         assert_eq!(shared.read().unwrap().as_ref().unwrap().get("b"), None);
         let gif = images::sha1_hex(b"GIF89a..");
@@ -481,6 +635,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_without_a_visual_change_does_not_upload() {
+        let dir = TempDir::new();
+        let misskey = FakeMisskey::new().with_emojis(vec![emoji("a", Some("c"), &[], "u-a")]);
+        let job = EmojiCheckJob::new(
+            &misskey,
+            fetcher(),
+            &config(&dir, "[emoji.banner]\n"),
+            shared(),
+        );
+        job.run().await.unwrap();
+        job.run().await.unwrap();
+        misskey.set_emojis(vec![emoji("a", Some("d"), &[], "u-a")]);
+        job.run().await.unwrap();
+        assert_eq!(misskey.uploads(), 1);
+        assert!(
+            misskey.texts().is_empty(),
+            "no notify section, so nothing is posted"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_the_banner_later_makes_it() {
+        let dir = TempDir::new();
+        let misskey = FakeMisskey::new().with_emojis(vec![emoji("a", None, &[], "u-a")]);
+        let shared = shared();
+        EmojiCheckJob::new(
+            &misskey,
+            fetcher(),
+            &config(&dir, "[emoji.notify]\n"),
+            shared.clone(),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(misskey.uploads(), 0);
+        let config = config(&dir, "[emoji.notify]\n[emoji.banner]\n");
+        EmojiCheckJob::new(&misskey, fetcher(), &config, shared.clone())
+            .run()
+            .await
+            .unwrap();
+        assert!(misskey.current_banner().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_banner_removed_or_replaced_by_someone_is_made_again() {
+        let dir = TempDir::new();
+        let misskey = FakeMisskey::new().with_emojis(vec![emoji("a", None, &[], "u-a")]);
+        let job = EmojiCheckJob::new(
+            &misskey,
+            fetcher(),
+            &config(&dir, "[emoji.banner]\n"),
+            shared(),
+        );
+        job.run().await.unwrap();
+        let banner = misskey.current_banner().await.unwrap().unwrap();
+
+        misskey.delete_file(&banner.id).await.unwrap();
+        job.run().await.unwrap();
+        assert_eq!(misskey.uploads(), 2);
+        assert_eq!(
+            misskey.current_banner().await.unwrap().unwrap().name,
+            banner.name
+        );
+
+        let photo = misskey
+            .upload_file("photo.jpg", "image/jpeg", vec![1])
+            .await
+            .unwrap();
+        misskey.set_banner(Some(&photo)).await.unwrap();
+        job.run().await.unwrap();
+        assert_eq!(
+            misskey.current_banner().await.unwrap().unwrap().name,
+            banner.name
+        );
+        assert!(misskey.file_names().contains(&"photo.jpg".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn only_a_rename_that_changes_the_order_makes_the_banner_again() {
+        let dir = TempDir::new();
+        let fetcher = || {
+            FakeFetcher::default()
+                .with("u-red", Response::Image(PNG.to_vec(), None))
+                .with("u-blue", Response::Image(BLUE.to_vec(), None))
+        };
+        let misskey = FakeMisskey::new().with_emojis(vec![
+            emoji("a", None, &[], "u-red"),
+            emoji("b", None, &[], "u-blue"),
+        ]);
+        let shared = shared();
+        let config = config(&dir, "[emoji.banner]\n");
+        let run = || EmojiCheckJob::new(&misskey, fetcher(), &config, shared.clone());
+        run().run().await.unwrap();
+        // 並び（赤、青）が変わらない名前変更。
+        misskey.set_emojis(vec![
+            emoji("aa", None, &[], "u-red"),
+            emoji("b", None, &[], "u-blue"),
+        ]);
+        run().run().await.unwrap();
+        assert_eq!(misskey.uploads(), 1);
+        // 並びが（青、赤）に変わる名前変更。
+        misskey.set_emojis(vec![
+            emoji("z", None, &[], "u-red"),
+            emoji("b", None, &[], "u-blue"),
+        ]);
+        run().run().await.unwrap();
+        assert_eq!(misskey.uploads(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_banner_not_uploaded_by_the_bot_is_kept() {
+        // bot の接頭辞で始まっていても、bot の付ける形でなければ所有者のファイル。
+        for name in ["photo.jpg", "banner_summer.png"] {
+            let dir = TempDir::new();
+            let misskey = FakeMisskey::new()
+                .with_emojis(vec![emoji("a", None, &[], "u-a")])
+                .with_banner("theirs", name);
+            let job = EmojiCheckJob::new(
+                &misskey,
+                fetcher(),
+                &config(&dir, "[emoji.banner]\n"),
+                shared(),
+            );
+            job.run().await.unwrap();
+            misskey.set_emojis(vec![
+                emoji("a", None, &[], "u-a"),
+                emoji("b", None, &[], "u-b"),
+            ]);
+            job.run().await.unwrap();
+            assert_ne!(misskey.banner_id().as_deref(), Some("theirs"), "{name}");
+            assert!(misskey.file_names().contains(&name.to_owned()), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_banner_that_cannot_be_set_is_deleted_and_tried_again() {
+        let dir = TempDir::new();
+        let misskey = FakeMisskey::new()
+            .with_emojis(vec![emoji("a", None, &[], "u-a")])
+            .with_banner("old", "banner_0123456789abcdef.png")
+            .failing(Fail::SetBanner);
+        let job = EmojiCheckJob::new(
+            &misskey,
+            fetcher(),
+            &config(&dir, "[emoji.banner]\n"),
+            shared(),
+        );
+        job.run().await.unwrap();
+        assert_eq!(misskey.uploads(), 1);
+        assert_eq!(misskey.file_names(), ["banner_0123456789abcdef.png"]);
+        assert_eq!(misskey.banner_id().as_deref(), Some("old"));
+
+        misskey.set_failing(None);
+        job.run().await.unwrap();
+        assert_eq!(misskey.uploads(), 2);
+        let banner = misskey.current_banner().await.unwrap().unwrap();
+        assert_ne!(banner.id, "old");
+        assert_eq!(misskey.file_names(), [banner.name]);
+    }
+
+    #[tokio::test]
+    async fn the_bot_banner_is_removed_when_all_emojis_are_deleted() {
+        let dir = TempDir::new();
+        let misskey = FakeMisskey::new().with_emojis(vec![emoji("a", None, &[], "u-a")]);
+        let job = EmojiCheckJob::new(
+            &misskey,
+            fetcher(),
+            &config(&dir, "[emoji.notify]\n[emoji.banner]\n"),
+            shared(),
+        );
+        job.run().await.unwrap();
+        assert!(misskey.banner_id().is_some());
+
+        // 空の一覧が 2 回続いて全部の削除として受け入れたら、bot のバナーを外して消す。
+        misskey.set_emojis(Vec::new());
+        job.run().await.unwrap();
+        job.run().await.unwrap();
+        assert_eq!(misskey.banner_id(), None);
+        assert!(misskey.file_names().is_empty());
+        // 外したあとは何もしない。
+        job.run().await.unwrap();
+        assert_eq!(misskey.banner_id(), None);
+        assert_eq!(misskey.uploads(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_banner_that_cannot_be_built_is_not_tried_again_until_the_list_changes() {
+        let dir = TempDir::new();
+        // デコードできない GIF。ETag があるので、2 回目は 304 になり、画像ファイルを書き直さない。
+        let fetcher = FakeFetcher::default()
+            .with("u-a", Response::Image(PNG.to_vec(), None))
+            .with("u-b", Response::Cached(b"GIF89a..".to_vec(), "e1"));
+        let misskey = FakeMisskey::new().with_emojis(vec![emoji("b", None, &[], "u-b")]);
+        let job = EmojiCheckJob::new(
+            &misskey,
+            fetcher,
+            &config(&dir, "[emoji.banner]\n"),
+            shared(),
+        );
+        job.run().await.unwrap();
+        assert_eq!(misskey.uploads(), 0);
+
+        // 画像ファイルがデコードできるものに替わっても、一覧が同じなら作り直さない。
+        let gif = images::sha1_hex(b"GIF89a..");
+        std::fs::write(dir.join("images").join(format!("{gif}.gif")), PNG).unwrap();
+        job.run().await.unwrap();
+        assert_eq!(misskey.uploads(), 0);
+
+        // 一覧が変われば作り直す。
+        misskey.set_emojis(vec![
+            emoji("a", None, &[], "u-a"),
+            emoji("b", None, &[], "u-b"),
+        ]);
+        job.run().await.unwrap();
+        assert_eq!(misskey.uploads(), 1);
+    }
+
+    #[tokio::test]
     async fn nothing_is_posted_until_the_state_is_saved() {
         let dir = TempDir::new();
         let misskey = FakeMisskey::new().with_emojis(vec![emoji("a", None, &[], "u-a")]);
@@ -627,5 +999,20 @@ mod tests {
             shared(),
         );
         assert!(job.run().await.is_err());
+    }
+
+    #[test]
+    fn only_names_made_by_banner_name_are_the_bots() {
+        let set = EmojiSet::from_api(vec![emoji("a", None, &[], "u-a")]);
+        assert!(is_bot_banner(&banner_name(&set)));
+        for name in [
+            "banner_summer.png",
+            "banner_1.png",
+            "banner_0123456789abcdef.jpg",
+            "banner_0123456789ABCDEF.png",
+            "banner_0123456789abcde.png",
+        ] {
+            assert!(!is_bot_banner(name), "{name}");
+        }
     }
 }
