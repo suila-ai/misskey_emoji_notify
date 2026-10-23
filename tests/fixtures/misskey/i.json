@@ -1,0 +1,246 @@
+{
+  "id": "as4pl7oasexx0004",
+  "name": "Alice",
+  "username": "alice",
+  "host": null,
+  "avatarUrl": "https://misskey.example.com/proxy/avatar.webp?url=https%3A%2F%2Fmisskey.example.com%2Ffiles%2Fb489e9b5-be67-413c-91dd-c8ea97b2752b&avatar=1",
+  "avatarBlurhash": "eRFRsgt65NX4Rj}-j[axj?ju53WB=~s;s;t1a{ofj[ay=~ofImR%ay",
+  "avatarDecorations": [
+    {
+      "id": "as4pl874sexx000v",
+      "offsetX": 0.1,
+      "url": "https://misskey.example.com/files/3c905f67-84e3-449a-b41a-73f90e901a41"
+    }
+  ],
+  "isBot": false,
+  "isCat": true,
+  "emojis": {},
+  "onlineStatus": "unknown",
+  "badgeRoles": [
+    {
+      "name": "role1",
+      "iconUrl": "https://misskey.example.com/files/3c905f67-84e3-449a-b41a-73f90e901a41",
+      "displayOrder": 0
+    }
+  ],
+  "url": null,
+  "uri": null,
+  "movedTo": null,
+  "alsoKnownAs": null,
+  "createdAt": "2026-10-09T15:53:11.194Z",
+  "updatedAt": "2026-10-09T15:53:12.063Z",
+  "lastFetchedAt": null,
+  "bannerUrl": "https://misskey.example.com/files/b489e9b5-be67-413c-91dd-c8ea97b2752b",
+  "bannerBlurhash": "eRFRsgt65NX4Rj}-j[axj?ju53WB=~s;s;t1a{ofj[ay=~ofImR%ay",
+  "isLocked": false,
+  "isSilenced": false,
+  "isSuspended": false,
+  "description": "dummy profile",
+  "location": null,
+  "birthday": "2000-01-01",
+  "lang": null,
+  "fields": [
+    {
+      "name": "field1",
+      "value": "value1"
+    }
+  ],
+  "verifiedLinks": [],
+  "followersCount": 1,
+  "followingCount": 0,
+  "notesCount": 2,
+  "pinnedNoteIds": [
+    "as4pl8besexx0010"
+  ],
+  "pinnedNotes": [
+    {
+      "id": "as4pl8besexx0010",
+      "createdAt": "2026-10-09T15:53:12.026Z",
+      "userId": "as4pl7oasexx0004",
+      "user": {
+        "id": "as4pl7oasexx0004",
+        "name": "Alice",
+        "username": "alice",
+        "host": null,
+        "avatarUrl": "https://misskey.example.com/proxy/avatar.webp?url=https%3A%2F%2Fmisskey.example.com%2Ffiles%2Fb489e9b5-be67-413c-91dd-c8ea97b2752b&avatar=1",
+        "avatarBlurhash": "eRFRsgt65NX4Rj}-j[axj?ju53WB=~s;s;t1a{ofj[ay=~ofImR%ay",
+        "avatarDecorations": [
+          {
+            "id": "as4pl874sexx000v",
+            "offsetX": 0.1,
+            "url": "https://misskey.example.com/files/3c905f67-84e3-449a-b41a-73f90e901a41"
+          }
+        ],
+        "isBot": false,
+        "isCat": true,
+        "emojis": {},
+        "onlineStatus": "unknown",
+        "badgeRoles": [
+          {
+            "name": "role1",
+            "iconUrl": "https://misskey.example.com/files/3c905f67-84e3-449a-b41a-73f90e901a41",
+            "displayOrder": 0
+          }
+        ]
+      },
+      "text": "dummy note 1 #tag1 #tag2",
+      "cw": null,
+      "visibility": "public",
+      "localOnly": false,
+      "reactionAcceptance": null,
+      "renoteCount": 1,
+      "repliesCount": 1,
+      "reactionCount": 2,
+      "reactions": {
+        "👍": 1,
+        ":emoji1@.:": 1
+      },
+      "reactionEmojis": {},
+      "tags": [
+        "tag1",
+        "tag2"
+      ],
+      "fileIds": [],
+      "files": [],
+      "replyId": null,
+      "renoteId": null,
+      "clippedCount": 0
+    }
+  ],
+  "pinnedPageId": null,
+  "pinnedPage": null,
+  "publicReactions": true,
+  "followersVisibility": "public",
+  "followingVisibility": "public",
+  "chatScope": "mutual",
+  "canChat": true,
+  "roles": [
+    {
+      "id": "as4pl848sexx000k",
+      "name": "role1",
+      "color": "#ff0000",
+      "iconUrl": "https://misskey.example.com/files/3c905f67-84e3-449a-b41a-73f90e901a41",
+      "description": "dummy role",
+      "isModerator": false,
+      "isAdministrator": false,
+      "displayOrder": 0
+    },
+    {
+      "id": "as4pl85xsexx000q",
+      "name": "role2",
+      "color": null,
+      "iconUrl": null,
+      "description": "dummy role",
+      "isModerator": false,
+      "isAdministrator": false,
+      "displayOrder": 0
+    }
+  ],
+  "memo": null,
+  "twoFactorEnabled": false,
+  "usePasswordLessLogin": false,
+  "securityKeys": false,
+  "avatarId": "as4pl7zxsexx000c",
+  "bannerId": "as4pl7zxsexx000c",
+  "followedMessage": null,
+  "isModerator": false,
+  "isAdmin": false,
+  "injectFeaturedNote": true,
+  "receiveAnnouncementEmail": true,
+  "alwaysMarkNsfw": false,
+  "autoSensitive": false,
+  "carefulBot": false,
+  "autoAcceptFollowed": true,
+  "noCrawle": false,
+  "preventAiLearning": true,
+  "isExplorable": true,
+  "isDeleted": false,
+  "twoFactorBackupCodesStock": "none",
+  "hideOnlineStatus": false,
+  "hasUnreadSpecifiedNotes": false,
+  "hasUnreadMentions": false,
+  "hasUnreadChatMessages": false,
+  "hasUnreadAnnouncement": true,
+  "unreadAnnouncements": [
+    {
+      "createdAt": "2026-10-09T15:53:11.559Z",
+      "id": "as4pl7yfsexx0009",
+      "updatedAt": null,
+      "text": "dummy text",
+      "title": "dummy announcement",
+      "imageUrl": null,
+      "icon": "info",
+      "display": "normal",
+      "needConfirmationToRead": false,
+      "isActive": true,
+      "forExistingUsers": false,
+      "silence": false,
+      "userId": null
+    }
+  ],
+  "hasUnreadAntenna": false,
+  "hasUnreadChannel": false,
+  "hasUnreadNotification": true,
+  "hasPendingReceivedFollowRequest": false,
+  "unreadNotificationsCount": 8,
+  "mutedWords": [],
+  "hardMutedWords": [],
+  "mutedInstances": [],
+  "mutingNotificationTypes": [],
+  "notificationRecieveConfig": {},
+  "emailNotificationTypes": [
+    "follow",
+    "receiveFollowRequest"
+  ],
+  "achievements": [],
+  "loggedInDays": 1,
+  "policies": {
+    "gtlAvailable": true,
+    "ltlAvailable": true,
+    "canPublicNote": true,
+    "mentionLimit": 20,
+    "canInvite": false,
+    "inviteLimit": 0,
+    "inviteLimitCycle": 10080,
+    "inviteExpirationTime": 0,
+    "canManageCustomEmojis": false,
+    "canManageAvatarDecorations": false,
+    "canSearchNotes": false,
+    "canSearchUsers": true,
+    "canUseTranslator": true,
+    "canHideAds": false,
+    "driveCapacityMb": 8192,
+    "maxFileSizeMb": 30,
+    "alwaysMarkNsfw": false,
+    "canUpdateBioMedia": true,
+    "pinLimit": 5,
+    "antennaLimit": 100,
+    "wordMuteLimit": 200,
+    "webhookLimit": 100,
+    "clipLimit": 10,
+    "noteEachClipsLimit": 200,
+    "userListLimit": 100,
+    "userEachUserListsLimit": 50,
+    "rateLimitFactor": 0.3,
+    "avatarDecorationLimit": 1,
+    "canImportAntennas": true,
+    "canImportBlocking": true,
+    "canImportFollowing": true,
+    "canImportMuting": true,
+    "canImportUserLists": true,
+    "chatAvailability": "available",
+    "uploadableFileTypes": [
+      "text/*",
+      "application/json",
+      "image/*",
+      "video/*",
+      "audio/*"
+    ],
+    "noteDraftLimit": 10,
+    "scheduledNoteLimit": 1,
+    "watermarkAvailable": true
+  },
+  "email": null,
+  "emailVerified": false,
+  "securityKeysList": []
+}

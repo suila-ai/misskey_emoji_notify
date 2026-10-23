@@ -1,1 +1,7 @@
 /target
+
+# 実行時の設定。トークンを含むのでコミットしない
+config.toml
+
+# 実行時の状態の置き場（state_dir の既定）
+/state/
