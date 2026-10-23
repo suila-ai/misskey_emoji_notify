@@ -1,11 +1,15 @@
 //! ジョブ。Misskey から取ったものを Misskey に反映する「判断」の層。
 //!
 //! 外部 I/O は [`Misskey`](crate::misskey::Misskey) と [`ImageFetcher`](crate::images::ImageFetcher) の
-//! トレイト越しに行い、テストではフェイクに差し替える。
+//! トレイト越しに行い、テストではフェイクに差し替える。今の時刻も `clock` で差し替える。
 
 pub mod emoji_check;
+pub mod ranking;
 
 pub use emoji_check::EmojiCheckJob;
+pub use ranking::RankingJob;
+
+use chrono::{DateTime, FixedOffset};
 
 /// scheduler が定期に実行する 1 つの仕事。
 pub trait Job {
@@ -13,6 +17,9 @@ pub trait Job {
     fn name(&self) -> &'static str;
     async fn run(&self) -> Result<(), Error>;
 }
+
+/// 今の時刻（JST）。テストでは決まった時刻を返す関数に差し替える。
+pub type Clock = fn() -> DateTime<FixedOffset>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -1,6 +1,6 @@
 //! Misskey のカスタム絵文字の変更を通知する bot。
 //!
-//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿し、全絵文字を並べたバナーを作る。
+//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿し、全絵文字を並べたバナーを作り、前日のリアクションのランキングを投稿する。
 
 mod banner;
 mod config;
@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::emoji::EmojiSet;
 use crate::images::HttpImageFetcher;
-use crate::jobs::{EmojiCheckJob, Job};
+use crate::jobs::{EmojiCheckJob, Job, RankingJob};
 use crate::misskey::MiapiMisskey;
 
 #[tokio::main]
@@ -43,7 +43,7 @@ async fn main() -> ExitCode {
 /// Misskey と画像の取得元を叩くときのタイムアウト。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 絵文字の確認の 1 回の実行に許す時間。初回は全絵文字の画像を取るので長い。
+/// 絵文字の確認とランキングの 1 回の実行に許す時間。初回は全絵文字の画像を取り、ランキングは 1 日分のノートを 100 件ずつ遡るので長い。
 /// compose.yaml の `stop_grace_period` はこれより長くする。
 const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -75,6 +75,7 @@ async fn run() -> Result<(), Error> {
 
     let emoji_set = SharedEmojiSet::default();
 
+    let shutdown = CancellationToken::new();
     let emoji_check = if config.needs_emoji_check() {
         // 状態の置き場は絵文字一覧の確認にしか使わない。確認しない設定でも作ると、作れない場所では起動に失敗する。
         state::create_dir(&config.emoji.state_dir)?;
@@ -91,8 +92,11 @@ async fn run() -> Result<(), Error> {
         info!("no notify or banner is configured; the emoji check will not run");
         None
     };
+    let ranking = config.ranking.as_ref().map(|ranking| {
+        let job = RankingJob::new(&misskey, ranking, time::now, shutdown.clone());
+        (job, &ranking.cron)
+    });
 
-    let shutdown = CancellationToken::new();
     let signals = {
         let shutdown = shutdown.clone();
         async move {
@@ -106,6 +110,7 @@ async fn run() -> Result<(), Error> {
     tokio::join!(
         signals,
         run_if_configured(emoji_check.map(|job| (job, &config.emoji.cron)), &shutdown),
+        run_if_configured(ranking, &shutdown),
     );
     info!("stopped");
     Ok(())

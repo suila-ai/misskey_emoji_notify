@@ -1,7 +1,8 @@
 //! TOML の設定ファイル。起動時に 1 回だけ読む。
 //!
 //! 設定は、それが効くものごとの節に置く。`[emoji]` は絵文字一覧の確認（`state_dir` と `cron`）で、その一覧から作る通知と
-//! バナーを `[emoji.notify]` と `[emoji.banner]` に書く。`[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
+//! バナーを `[emoji.notify]` と `[emoji.banner]` に書く。`[ranking]` は前日のリアクションのランキング。
+//! `[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -15,6 +16,8 @@ use url::Url;
 
 /// 絵文字一覧を確かめる時刻の既定（10 分ごと）。
 const DEFAULT_CHECK_CRON: &str = "0 */10 * * * *";
+/// ランキングを投稿する時刻の既定（0 時）。
+const DEFAULT_RANKING_CRON: &str = "0 0 0 * * *";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +26,8 @@ pub struct Config {
     /// 絵文字一覧の確認と、その一覧から作る通知とバナー。
     #[serde(default)]
     pub emoji: EmojiConfig,
+    /// 前日のリアクションのランキング。
+    pub ranking: Option<RankingConfig>,
 }
 
 /// 絵文字一覧の確認。通知かバナーを使うときに動く。
@@ -73,6 +78,16 @@ pub struct NotifyConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BannerConfig {}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankingConfig {
+    #[serde(default)]
+    pub visibility: Visibility,
+    /// 集計して投稿する時刻（JST）。省くと 0 時。
+    #[serde(default = "default_ranking_cron", deserialize_with = "cron")]
+    pub cron: Cron,
+}
 
 /// ノートの公開範囲。設定には小文字で書く。
 ///
@@ -153,6 +168,10 @@ fn default_check_cron() -> Cron {
     parse_cron(DEFAULT_CHECK_CRON).expect("the default cron expression is valid")
 }
 
+fn default_ranking_cron() -> Cron {
+    parse_cron(DEFAULT_RANKING_CRON).expect("the default cron expression is valid")
+}
+
 fn cron<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Cron, D::Error> {
     let text = String::deserialize(deserializer)?;
     parse_cron(&text).map_err(|error| {
@@ -202,6 +221,7 @@ token = "token"
         assert_eq!(config.emoji.cron, parse_cron(DEFAULT_CHECK_CRON).unwrap());
         assert!(config.emoji.notify.is_none());
         assert!(config.emoji.banner.is_none());
+        assert!(config.ranking.is_none());
         assert!(!config.needs_emoji_check());
     }
 
@@ -217,6 +237,10 @@ cron = "*/5 * * * *"
 visibility = "specified"
 
 [emoji.banner]
+
+[ranking]
+visibility = "public"
+cron = "0 30 0 * * *"
 "#
         );
         let config = parse(&text).unwrap();
@@ -227,6 +251,9 @@ visibility = "specified"
             Visibility::Specified
         );
         assert!(config.emoji.banner.is_some());
+        let ranking = config.ranking.unwrap();
+        assert_eq!(ranking.visibility, Visibility::Public);
+        assert_eq!(ranking.cron, parse_cron("0 30 0 * * *").unwrap());
     }
 
     #[test]
@@ -235,6 +262,8 @@ visibility = "specified"
         assert!(notify_only.needs_emoji_check());
         let banner_only = parse(&format!("{MINIMAL}\n[emoji.banner]\n")).unwrap();
         assert!(banner_only.needs_emoji_check());
+        let ranking_only = parse(&format!("{MINIMAL}\n[ranking]\n")).unwrap();
+        assert!(!ranking_only.needs_emoji_check());
         // [emoji] は確認の設定だけで、機能の節ではない。
         let settings_only = parse(&format!("{MINIMAL}\n[emoji]\nstate_dir = \"x\"\n")).unwrap();
         assert!(!settings_only.needs_emoji_check());
@@ -260,10 +289,7 @@ visibility = "specified"
 
     #[test]
     fn an_unknown_visibility_is_an_error() {
-        let error = parse(&format!(
-            "{MINIMAL}\n[emoji.notify]\nvisibility = \"direct\"\n"
-        ))
-        .unwrap_err();
+        let error = parse(&format!("{MINIMAL}\n[ranking]\nvisibility = \"direct\"\n")).unwrap_err();
         assert!(crate::error_chain(&error).contains("direct"), "{error}");
     }
 
@@ -272,7 +298,7 @@ visibility = "specified"
         let error = parse(&format!("{MINIMAL}\n[emoji]\ncron = \"every hour\"\n")).unwrap_err();
         assert!(crate::error_chain(&error).contains("every hour"), "{error}");
         // 次の時刻が来ない式も弾く。
-        let error = parse(&format!("{MINIMAL}\n[emoji]\ncron = \"0 0 0 30 2 *\"\n")).unwrap_err();
+        let error = parse(&format!("{MINIMAL}\n[ranking]\ncron = \"0 0 0 30 2 *\"\n")).unwrap_err();
         assert!(crate::error_chain(&error).contains("30 2"), "{error}");
     }
 
@@ -287,7 +313,11 @@ visibility = "specified"
     #[test]
     fn the_example_config_is_valid() {
         let config = parse(include_str!("../config.example.toml")).unwrap();
-        assert!(config.emoji.notify.is_some() && config.emoji.banner.is_some());
+        assert!(
+            config.emoji.notify.is_some()
+                && config.emoji.banner.is_some()
+                && config.ranking.is_some()
+        );
     }
 
     #[test]

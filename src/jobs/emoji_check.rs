@@ -418,7 +418,7 @@ mod tests {
         job.run().await.unwrap();
 
         let created = misskey.created();
-        let texts: Vec<&str> = created.iter().map(|c| c.text.as_str()).collect();
+        let texts: Vec<&str> = created.iter().map(|c| c.note.text.as_str()).collect();
         assert_eq!(texts.len(), 4, "{texts:?}");
         assert!(
             texts[0].starts_with("【絵文字追加】\n$[x2 :c:]"),

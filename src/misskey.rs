@@ -2,6 +2,9 @@
 //!
 //! ジョブは [`Misskey`] トレイト越しに使い、テストでは `fake::FakeMisskey` に差し替える。
 
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
 use miapi::v2025_10_0::api::notes::create::RequestVisibility;
 use miapi::v2025_10_0::{Client, types};
 use tracing::info;
@@ -10,6 +13,18 @@ use url::Url;
 use crate::config::Visibility;
 
 pub use miapi::Error;
+
+/// 時間を置けば通りうる失敗か。通信の失敗、サーバの 5xx、レートリミット。
+pub fn is_transient(error: &Error) -> bool {
+    match error {
+        Error::Transport(_) => true,
+        Error::Api(error) => {
+            error.status == 429 || error.status >= 500 || error.code == "RATE_LIMIT_EXCEEDED"
+        }
+        Error::UnexpectedResponse { status, .. } => *status == 429 || *status >= 500,
+        _ => false,
+    }
+}
 
 /// カスタム絵文字。`emojis` が返す項目の必要なところだけ。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +39,11 @@ pub struct Emoji {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
     pub id: String,
+    /// 本文。本文の無いノート（ファイルだけ等）は空。
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+    /// リアクションの絵文字（`:name@.:` や Unicode）ごとの数。
+    pub reactions: HashMap<String, u64>,
 }
 
 /// これから作るノート。
@@ -31,6 +51,13 @@ pub struct Note {
 pub struct NewNote<'a> {
     pub text: &'a str,
     pub visibility: Visibility,
+}
+
+/// [`Misskey::local_timeline`] と [`Misskey::my_notes`] の起点。この時刻か ID より前のものを返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Until {
+    Date(DateTime<Utc>),
+    Id(String),
 }
 
 /// プロフィールのバナーに使っているドライブのファイル。
@@ -45,6 +72,10 @@ pub trait Misskey {
     /// ローカルのカスタム絵文字の一覧。
     async fn emojis(&self) -> Result<Vec<Emoji>, Error>;
     async fn create_note(&self, note: NewNote<'_>) -> Result<Note, Error>;
+    /// `until` より前のローカルタイムラインのノート。新しい順に `limit` 件まで。
+    async fn local_timeline(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error>;
+    /// `until` より前の自分のノート。新しい順に `limit` 件まで。他人への返信を含み、リノートは含めない。
+    async fn my_notes(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error>;
     /// ドライブにファイルを上げ、その ID を返す。中身が既存のファイルと同じでも、新しいファイルにする。
     async fn upload_file(
         &self,
@@ -63,6 +94,8 @@ pub trait Misskey {
 #[derive(Debug)]
 pub struct MiapiMisskey {
     client: Client,
+    /// 自分のユーザー ID。`users/notes` で自分のノートを引くのに使う。
+    user_id: String,
 }
 
 impl MiapiMisskey {
@@ -73,7 +106,10 @@ impl MiapiMisskey {
         let client = Client::with_http_client(http, server.as_str(), Some(token))?;
         let me = client.i().await?;
         info!(username = %me.username, user_id = %me.id, "connected to Misskey");
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            user_id: me.id,
+        })
     }
 }
 
@@ -99,6 +135,33 @@ impl Misskey for MiapiMisskey {
             .text(note.text)
             .await?;
         Ok(response.created_note.into())
+    }
+
+    async fn local_timeline(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error> {
+        let call = self.client.notes().local_timeline().limit(i64::from(limit));
+        let call = match until {
+            Until::Date(date) => call.until_date(date.timestamp_millis()),
+            Until::Id(id) => call.until_id(id.as_str()),
+        };
+        Ok(call.await?.into_iter().map(Note::from).collect())
+    }
+
+    async fn my_notes(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error> {
+        // 返信も含めて頼む。Misskey（2026.3.2）は DB から引く経路で withReplies=false を見ないので、
+        // false では経路によって結果が変わる。
+        let call = self
+            .client
+            .users()
+            .notes()
+            .user_id(&self.user_id)
+            .with_replies(true)
+            .with_renotes(false)
+            .limit(i64::from(limit));
+        let call = match until {
+            Until::Date(date) => call.until_date(date.timestamp_millis()),
+            Until::Id(id) => call.until_id(id.as_str()),
+        };
+        Ok(call.await?.into_iter().map(Note::from).collect())
     }
 
     async fn upload_file(
@@ -175,16 +238,29 @@ impl From<types::EmojiSimple> for Emoji {
 /// miapi の `Note` から、bot が使うところだけを取り出す。
 impl From<types::Note> for Note {
     fn from(note: types::Note) -> Self {
-        Self { id: note.id }
+        Self {
+            id: note.id,
+            text: note.text.unwrap_or_default(),
+            created_at: note.created_at,
+            // Misskey の JSON の数は整数だが、spec の `number` は f64 になる。
+            reactions: note
+                .reactions
+                .into_iter()
+                .map(|(key, count)| (key, count.round().max(0.0) as u64))
+                .collect(),
+        }
     }
 }
 
 /// ジョブのテストで使う、メモリ上の Misskey。
 #[cfg(test)]
 pub mod fake {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{BannerFile, Emoji, Error, Misskey, NewNote, Note};
+    use chrono::{DateTime, TimeDelta, Utc};
+
+    use super::{BannerFile, Emoji, Error, Misskey, NewNote, Note, Until};
     use crate::config::Visibility;
     use crate::mfm::{MAX_NOTE_LENGTH, note_length};
 
@@ -193,6 +269,7 @@ pub mod fake {
     pub enum Fail {
         Emojis,
         Create,
+        Timeline,
         Upload,
         SetBanner,
         /// 投稿を INVALID_PARAM で拒む。
@@ -204,7 +281,7 @@ pub mod fake {
     /// 作ったノート。
     #[derive(Debug, Clone, PartialEq)]
     pub struct Created {
-        pub text: String,
+        pub note: Note,
         pub visibility: Visibility,
     }
 
@@ -220,6 +297,8 @@ pub mod fake {
         emojis: Vec<Emoji>,
         /// 自分が作ったノート。作成順。
         created: Vec<Created>,
+        /// ローカルタイムラインのノート。新しい順に並べて返す。
+        timeline: Vec<Note>,
         files: Vec<File>,
         /// 次に上げるファイルの通し番号。削除しても ID は重ならない。
         next_file: u64,
@@ -228,13 +307,27 @@ pub mod fake {
         banner_id: Option<String>,
         next_id: u64,
         fail: Option<Fail>,
+        /// `fail` を失敗させる残りの回数。`None` なら何度でも失敗させる。
+        fail_times: Option<u32>,
         /// 応答を返さずに止まる操作。
         hang: Option<Fail>,
+        base_time: DateTime<Utc>,
+        /// `local_timeline` が呼ばれた起点。
+        timeline_queries: Vec<Until>,
     }
 
     #[derive(Debug, Default)]
     pub struct FakeMisskey {
         state: Mutex<State>,
+    }
+
+    pub fn note(id: &str, text: &str, created_at: DateTime<Utc>) -> Note {
+        Note {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            created_at,
+            reactions: HashMap::new(),
+        }
     }
 
     fn api_error(endpoint: &str, code: &str) -> Error {
@@ -255,9 +348,35 @@ pub mod fake {
         }))
     }
 
+    /// `notes` のうち `until` より前のものを、新しい順に `limit` 件まで。fake の ID は `note10` が `note9` より前に
+    /// 並ぶので、ID は文字列で比べず位置で切る。
+    fn before(mut notes: Vec<Note>, until: &Until, limit: u8) -> Vec<Note> {
+        notes.sort_by_key(|note| std::cmp::Reverse(note.created_at));
+        match until {
+            Until::Date(date) => notes.retain(|note| note.created_at < *date),
+            Until::Id(id) => match notes.iter().position(|note| &note.id == id) {
+                Some(index) => drop(notes.drain(..=index)),
+                None => notes.clear(),
+            },
+        }
+        notes.truncate(usize::from(limit));
+        notes
+    }
+
     impl FakeMisskey {
         pub fn new() -> Self {
-            Self::default()
+            Self {
+                state: Mutex::new(State {
+                    base_time: Utc::now() - TimeDelta::days(1),
+                    ..State::default()
+                }),
+            }
+        }
+
+        /// 作るノートの作成日時の起点。
+        pub fn with_base_time(self, base_time: DateTime<Utc>) -> Self {
+            self.state.lock().unwrap().base_time = base_time;
+            self
         }
 
         pub fn with_emojis(self, emojis: Vec<Emoji>) -> Self {
@@ -267,6 +386,11 @@ pub mod fake {
 
         pub fn set_emojis(&self, emojis: Vec<Emoji>) {
             self.state.lock().unwrap().emojis = emojis;
+        }
+
+        pub fn with_timeline(self, notes: Vec<Note>) -> Self {
+            self.state.lock().unwrap().timeline = notes;
+            self
         }
 
         /// 既にあるドライブのファイルをバナーにしておく。
@@ -281,6 +405,12 @@ pub mod fake {
             self
         }
 
+        /// 既に投稿した自分のノートを足す。
+        pub fn with_own_note(self, text: &str) -> Self {
+            self.state.lock().unwrap().push(text, Visibility::Home);
+            self
+        }
+
         /// 指定した操作を失敗させる。
         pub fn failing(self, fail: Fail) -> Self {
             self.state.lock().unwrap().fail = Some(fail);
@@ -289,6 +419,15 @@ pub mod fake {
 
         pub fn set_failing(&self, fail: Option<Fail>) {
             self.state.lock().unwrap().fail = fail;
+        }
+
+        /// 指定した操作を `times` 回だけ失敗させ、その後は成功させる。
+        pub fn failing_times(self, fail: Fail, times: u32) -> Self {
+            let mut state = self.state.lock().unwrap();
+            state.fail = Some(fail);
+            state.fail_times = Some(times);
+            drop(state);
+            self
         }
 
         /// 指定した操作を、応答を返さずに止める。timeout で打ち切られる場面を作るのに使う。
@@ -310,7 +449,7 @@ pub mod fake {
 
         /// 作ったノートの本文。作成順。
         pub fn texts(&self) -> Vec<String> {
-            self.created().into_iter().map(|c| c.text).collect()
+            self.created().into_iter().map(|c| c.note.text).collect()
         }
 
         /// ドライブのファイルの名前。残っているものだけ。
@@ -332,21 +471,38 @@ pub mod fake {
         pub fn banner_id(&self) -> Option<String> {
             self.state.lock().unwrap().banner_id.clone()
         }
+
+        pub fn timeline_queries(&self) -> Vec<Until> {
+            self.state.lock().unwrap().timeline_queries.clone()
+        }
     }
 
     impl State {
-        /// `operation` を失敗させるか。
-        fn should_fail(&self, operation: Fail) -> bool {
-            self.fail == Some(operation)
+        /// `operation` を失敗させるか。回数を決めていれば、その回数だけ失敗させる。
+        fn should_fail(&mut self, operation: Fail) -> bool {
+            if self.fail != Some(operation) {
+                return false;
+            }
+            match &mut self.fail_times {
+                None => true,
+                Some(0) => false,
+                Some(times) => {
+                    *times -= 1;
+                    true
+                }
+            }
         }
 
         fn push(&mut self, text: &str, visibility: Visibility) -> Note {
             let note = Note {
                 id: format!("note{}", self.next_id),
+                text: text.to_owned(),
+                created_at: self.base_time + TimeDelta::minutes(self.next_id as i64),
+                reactions: HashMap::new(),
             };
             self.next_id += 1;
             self.created.push(Created {
-                text: text.to_owned(),
+                note: note.clone(),
                 visibility,
             });
             note
@@ -355,7 +511,7 @@ pub mod fake {
 
     impl Misskey for FakeMisskey {
         async fn emojis(&self) -> Result<Vec<Emoji>, Error> {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
             if state.should_fail(Fail::Emojis) {
                 return Err(api_error("emojis", "INTERNAL_ERROR"));
             }
@@ -377,6 +533,21 @@ pub mod fake {
                 return Err(api_error("notes/create", "INTERNAL_ERROR"));
             }
             Ok(created)
+        }
+
+        async fn local_timeline(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error> {
+            let mut state = self.state.lock().unwrap();
+            if state.should_fail(Fail::Timeline) {
+                return Err(api_error("notes/local-timeline", "INTERNAL_ERROR"));
+            }
+            state.timeline_queries.push(until.clone());
+            Ok(before(state.timeline.clone(), until, limit))
+        }
+
+        async fn my_notes(&self, until: &Until, limit: u8) -> Result<Vec<Note>, Error> {
+            let state = self.state.lock().unwrap();
+            let notes = state.created.iter().map(|c| c.note.clone()).collect();
+            Ok(before(notes, until, limit))
         }
 
         async fn upload_file(
@@ -483,8 +654,6 @@ mod tests {
     use wiremock::matchers::{body_json, body_string_contains, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use chrono::Utc;
-
     use super::*;
 
     const NOTE: &str = include_str!("../tests/fixtures/misskey/note.json");
@@ -518,8 +687,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_verifies_the_token() {
-        let (_server, _misskey) = connected().await;
+    async fn connect_verifies_the_token_and_remembers_the_user_id() {
+        let (_server, misskey) = connected().await;
+        assert_eq!(misskey.user_id, "as4pl7oasexx0004");
     }
 
     #[tokio::test]
@@ -585,6 +755,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(note.id, note_json()["id"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn local_timeline_sends_the_page_and_reads_reactions() {
+        let (server, misskey) = connected().await;
+        let mut note = note_json();
+        note["reactions"] = json!({":a@.:": 3, "👍": 1});
+        Mock::given(path("/api/notes/local-timeline"))
+            .and(body_json(
+                json!({"untilDate": 1700000000000i64, "limit": 100, "i": "tok"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([note])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let until = Until::Date(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap());
+        let notes = misskey.local_timeline(&until, 100).await.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].reactions[":a@.:"], 3);
+        assert_eq!(notes[0].reactions["👍"], 1);
+    }
+
+    #[tokio::test]
+    async fn my_notes_queries_own_notes_by_date_or_id() {
+        let (server, misskey) = connected().await;
+        Mock::given(path("/api/users/notes"))
+            .and(body_json(json!({
+                "userId": "as4pl7oasexx0004", "withReplies": true, "withRenotes": false, "untilDate": 1700000000000i64, "limit": 100, "i": "tok"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([note_json()])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/api/users/notes"))
+            .and(body_json(json!({
+                "userId": "as4pl7oasexx0004", "withReplies": true, "withRenotes": false, "untilId": "n1", "limit": 100, "i": "tok"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let by_date = misskey
+            .my_notes(
+                &Until::Date(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_date.len(), 1);
+        let by_id = misskey
+            .my_notes(&Until::Id("n1".to_owned()), 100)
+            .await
+            .unwrap();
+        assert!(by_id.is_empty());
     }
 
     #[tokio::test]
@@ -667,13 +891,24 @@ mod tests {
         assert!(!emojis.is_empty(), "up.sh registers some emojis");
 
         let text = format!("live_round_trip {}", Utc::now().to_rfc3339());
-        misskey
+        let note = misskey
             .create_note(NewNote {
                 text: &text,
                 visibility: Visibility::Specified,
             })
             .await
             .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mine = misskey
+            .my_notes(&Until::Date(Utc::now()), 10)
+            .await
+            .unwrap();
+        assert!(mine.iter().any(|n| n.id == note.id));
+        let timeline = misskey
+            .local_timeline(&Until::Date(Utc::now()), 10)
+            .await
+            .unwrap();
+        assert!(timeline.len() <= 10);
 
         let previous = misskey.current_banner().await.unwrap();
         let png = include_bytes!("../tests/fixtures/images/red.png").to_vec();
