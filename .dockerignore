@@ -1,0 +1,4 @@
+/target
+/.git
+**/config.toml
+scripts/misskey/.env.local
