@@ -1,0 +1,17 @@
+{
+	"name": "Rust",
+	"build": { "dockerfile": "Dockerfile" },
+	"init": true,
+	"features": {
+		// Debian 13 では moby を入れられないので Docker CE を使う
+		"ghcr.io/devcontainers/features/docker-in-docker:4": { "moby": false },
+		"ghcr.io/devcontainers/features/github-cli:1": {}
+	},
+	"mounts": [
+		"source=misskey_emoji_notify_devcontainer_claude-code-config,target=/home/vscode/.claude,type=volume",
+		"source=misskey_emoji_notify_devcontainer_gh-config,target=/home/vscode/.config/gh,type=volume"
+	],
+	"containerEnv": {
+		"CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+	}
+}

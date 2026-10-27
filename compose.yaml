@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    restart: always
+    # init を PID 1 にする。bot が PID 1 だと、シグナルの待ち受けを始める前（Misskey への接続中など）に届いた SIGTERM が無視され、stop_grace_period が過ぎるまで止まらない
+    init: true
+    # 停止時は、実行中の 1 回（最長 30 分の JOB_TIMEOUT。初回の全画像の取得と、ランキングの 1 日分の取得）が終わるまで待つ
+    stop_grace_period: 31m
+    volumes:
+      # 設定。config.example.toml を写して書く。トークンを含むのでコミットしない
+      # 長い書式で create_host_path を切るのは、ファイルが無いまま起動したときに、Docker がその場所にディレクトリを作らず、エラーで止めるため
+      - type: bind
+        source: ./config.toml
+        target: /app/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      # 状態（絵文字一覧の控えと画像）。state_dir の既定 state は、コンテナの作業ディレクトリ /app から引くのでここを指す。名前付きボリュームにし、コンテナを作り直しても残す
+      - state:/app/state
+
+volumes:
+  state:

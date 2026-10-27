@@ -1,0 +1,19 @@
+# 開発用の使い捨て Misskey。up.sh で立て、down.sh でデータごと消す。
+# bot が相手にするサーバと同じ 2026.3.2 を使う。
+# redis と postgres のイメージは、上流の compose_example.yml（2026.3.2）に合わせている。
+services:
+  web:
+    image: misskey/misskey:2026.3.2
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["127.0.0.1:3000:3000"]
+    volumes:
+      - ./config:/misskey/.config:ro
+  redis:
+    image: redis:7-alpine
+    healthcheck: { test: "redis-cli ping", interval: 2s, retries: 30 }
+  db:
+    image: postgres:18-alpine
+    env_file: ["./config/docker.env"]
+    healthcheck: { test: "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB", interval: 2s, retries: 30 }
