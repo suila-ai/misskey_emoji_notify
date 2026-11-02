@@ -104,13 +104,9 @@ impl ImageFetcher for HttpImageFetcher {
     }
 }
 
-/// `new` の全絵文字の画像を取り、`new` の各項目の `image` を埋める。
-///
-/// 前回の控え（`old` の同名か同 URL の項目）があれば、その `ETag` で条件付き要求にし、`304` なら前回の控えを引き継ぐ。
-/// 取得に失敗した絵文字と、[`SYNC_DEADLINE`] までに取れなかった絵文字も前回の控えを引き継ぐ（無ければ `None` のまま）。
-/// 画像ファイルは `dir` に `{sha1}.{ext}` で置き、同じ名前で同じ大きさのファイルがあれば書き直さない。
+/// `new` の全絵文字の画像を取り、`new` の各項目の `image` を埋める。前回の控えは `old` の同名か同 URL の項目から取り、
+/// 画像ファイルは `dir` に置く（[`sync_urls`]）。
 pub async fn sync<F: ImageFetcher>(fetcher: &F, old: &EmojiSet, new: &mut EmojiSet, dir: &Path) {
-    let deadline = tokio::time::Instant::now() + SYNC_DEADLINE;
     let targets: Vec<(String, String, Option<ImageInfo>)> = new
         .iter()
         .map(|emoji| {
@@ -121,14 +117,30 @@ pub async fn sync<F: ImageFetcher>(fetcher: &F, old: &EmojiSet, new: &mut EmojiS
             (emoji.name.clone(), emoji.url.clone(), previous)
         })
         .collect();
-    let results: Vec<(String, Option<ImageInfo>, bool)> = stream::iter(targets)
-        .map(|(name, url, previous)| async move {
+    for (name, image) in sync_urls(fetcher, targets, Some(dir)).await {
+        new.set_image(&name, image);
+    }
+}
+
+/// `targets`（キー、URL、前回の控え）の画像を取り、キーごとの画像を返す。
+///
+/// 前回の控えがあれば、その `ETag` で条件付き要求にし、`304` なら前回の控えを引き継ぐ。
+/// 取得に失敗したものと、[`SYNC_DEADLINE`] までに取れなかったものも前回の控えを引き継ぐ（無ければ `None` のまま）。
+/// `dir` があれば画像ファイルを `{sha1}.{ext}` で置き、同じ名前で同じ大きさのファイルがあれば書き直さない。
+pub async fn sync_urls<F: ImageFetcher, K>(
+    fetcher: &F,
+    targets: Vec<(K, String, Option<ImageInfo>)>,
+    dir: Option<&Path>,
+) -> Vec<(K, Option<ImageInfo>)> {
+    let deadline = tokio::time::Instant::now() + SYNC_DEADLINE;
+    let results: Vec<(K, Option<ImageInfo>, bool)> = stream::iter(targets)
+        .map(|(key, url, previous)| async move {
             let fetched =
                 tokio::time::timeout_at(deadline, fetch_one(fetcher, &url, previous.clone(), dir))
                     .await;
             match fetched {
-                Ok(image) => (name, image, false),
-                Err(_) => (name, previous, true),
+                Ok(image) => (key, image, false),
+                Err(_) => (key, previous, true),
             }
         })
         .buffer_unordered(CONCURRENCY)
@@ -145,21 +157,23 @@ pub async fn sync<F: ImageFetcher>(fetcher: &F, old: &EmojiSet, new: &mut EmojiS
             "some images were not fetched in time; keeping the previous ones"
         );
     }
-    for (name, image, _) in results {
-        new.set_image(&name, image);
-    }
+    results
+        .into_iter()
+        .map(|(key, image, _)| (key, image))
+        .collect()
 }
 
 async fn fetch_one<F: ImageFetcher>(
     fetcher: &F,
     url: &str,
     previous: Option<ImageInfo>,
-    dir: &Path,
+    dir: Option<&Path>,
 ) -> Option<ImageInfo> {
     // 前回の画像ファイルが消えているか空なら、304 でも取り直す必要があるので条件を付けない。
+    // ファイルを置かないときは、前回の控えがあれば付ける。
     let etag = previous
         .as_ref()
-        .filter(|image| has_content(&dir.join(image.file_name())))
+        .filter(|image| dir.is_none_or(|dir| has_content(&dir.join(image.file_name()))))
         .and_then(|image| image.etag.as_deref());
     match fetcher.fetch(url, etag).await {
         Ok(Fetched::NotModified) => {
@@ -186,12 +200,14 @@ async fn fetch_one<F: ImageFetcher>(
                 format: format.to_owned(),
                 etag,
             };
-            let path = dir.join(image.file_name());
-            if !is_saved(&path, data.len())
-                && let Err(error) = write_file(&path, &data)
-            {
-                warn!(url, error = %crate::error_chain(&error), "failed to save the image; keeping the previous one");
-                return previous;
+            if let Some(dir) = dir {
+                let path = dir.join(image.file_name());
+                if !is_saved(&path, data.len())
+                    && let Err(error) = write_file(&path, &data)
+                {
+                    warn!(url, error = %crate::error_chain(&error), "failed to save the image; keeping the previous one");
+                    return previous;
+                }
             }
             Some(image)
         }
