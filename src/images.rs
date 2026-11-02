@@ -147,6 +147,11 @@ pub async fn sync_urls<F: ImageFetcher, K>(
     let deadline = tokio::time::Instant::now() + SYNC_DEADLINE;
     let results: Vec<(K, Option<ImageInfo>, Outcome)> = stream::iter(targets)
         .map(|(key, url, previous)| async move {
+            // 期限を過ぎてから回ってきたものは取りに行かない。timeout_at は内側の future を先に poll するので、
+            // そのまま渡すと要求を始めてから捨てることになる。
+            if tokio::time::Instant::now() >= deadline {
+                return (key, previous, Outcome::TimedOut);
+            }
             let fetched =
                 tokio::time::timeout_at(deadline, fetch_one(fetcher, &url, previous.as_ref(), dir))
                     .await;
@@ -564,6 +569,33 @@ mod tests {
                 ("u-a".to_owned(), None),
                 ("u-b".to_owned(), Some("\"tag-b\"".to_owned())),
             ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_urls_starts_no_fetch_after_the_deadline() {
+        let urls: Vec<String> = (0..CONCURRENCY * 2).map(|i| format!("u-{i}")).collect();
+        let fetcher = urls.iter().fold(FakeFetcher::default(), |fetcher, url| {
+            fetcher.with(url, Response::Hang)
+        });
+        let previous = ImageInfo {
+            actual_url: "u#actual".to_owned(),
+            sha1: sha1_hex(PNG),
+            format: "png".to_owned(),
+            etag: None,
+        };
+        let targets = urls
+            .iter()
+            .map(|url| (url.clone(), url.clone(), Some(previous.clone())))
+            .collect();
+        let results = sync_urls(&fetcher, targets, None).await;
+        // 期限までに始めた CONCURRENCY 件だけを取りに行き、期限を過ぎてから回ってきたものは取りに行かない。
+        assert_eq!(fetcher.calls.lock().unwrap().len(), CONCURRENCY);
+        assert_eq!(results.len(), urls.len());
+        assert!(
+            results
+                .iter()
+                .all(|(_, image)| image.as_ref() == Some(&previous))
         );
     }
 
