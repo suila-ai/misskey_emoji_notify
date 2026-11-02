@@ -11,14 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use super::{Error, Job};
+use super::{Error, Job, post_texts, spawn_blocking_in_span};
 use crate::SharedEmojiSet;
 use crate::config::{EmojiConfig, Visibility};
 use crate::emoji::{self, EmojiSet, diff};
 use crate::images::{self, ImageFetcher};
-use crate::misskey::{BannerFile, Misskey, NewNote};
+use crate::misskey::{BannerFile, Misskey};
 use crate::{banner, mfm, state};
 
 /// bot が上げたバナーのファイル名の接頭辞。
@@ -67,14 +67,6 @@ fn save_and_swap(
         images::remove_unreferenced(dir, &set);
     }
     Ok(set)
-}
-
-/// 今の span の中で、`f` を別スレッドで動かす。
-fn spawn_blocking_in_span<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-) -> tokio::task::JoinHandle<T> {
-    let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || span.in_scope(f))
 }
 
 pub struct EmojiCheckJob<'a, M, F> {
@@ -158,28 +150,9 @@ impl<'a, M: Misskey, F: ImageFetcher> EmojiCheckJob<'a, M, F> {
         };
         let saved = self.commit(new).await?;
         if let Some((visibility, texts)) = posts {
-            self.post_changes(visibility, &texts).await;
+            post_texts(self.misskey, visibility, &texts).await;
         }
         Ok(saved)
-    }
-
-    async fn post_changes(&self, visibility: Visibility, texts: &[String]) {
-        for text in texts {
-            match self
-                .misskey
-                .create_note(NewNote {
-                    text,
-                    visibility,
-                    reply_id: None,
-                })
-                .await
-            {
-                Ok(note) => info!(note_id = %note.id, "posted"),
-                Err(error) => {
-                    error!(error = %crate::error_chain(&error), length = mfm::note_length(text), "failed to post a change; it will not be retried")
-                }
-            }
-        }
     }
 
     /// バナーを今の絵文字一覧に合わせる。今のバナーの名前が一覧から決まる名前と違えば作り直す。

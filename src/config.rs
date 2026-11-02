@@ -1,8 +1,9 @@
 //! TOML の設定ファイル。起動時に 1 回だけ読む。
 //!
-//! 設定は、それが効くものごとの節に置く。`[emoji]` は絵文字一覧の確認（`state_dir` と `cron`）で、その一覧から作る通知と
-//! バナーを `[emoji.notify]` と `[emoji.banner]` に書く。`[ranking]` は前日のリアクションのランキング、`[mention]` は
-//! メンションへの応答（`[mention.gacha]` と `[mention.fortune]`）。`[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
+//! 設定は、それが効くものごとの節に置く。`[emoji]` は絵文字の確認（`state_dir` と `cron`）で、カスタム絵文字の一覧から作る
+//! 通知とバナーを `[emoji.notify]` と `[emoji.banner]` に、標準絵文字（Unicode 絵文字）の画像の確認を `[emoji.unicode]` に書く。
+//! `[ranking]` は前日のリアクションのランキング、`[mention]` はメンションへの応答（`[mention.gacha]` と `[mention.fortune]`）。
+//! `[misskey]` と `[emoji]` 以外の節は、省くとその機能を使わない。
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -23,7 +24,7 @@ const DEFAULT_RANKING_CRON: &str = "0 0 0 * * *";
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub misskey: MisskeyConfig,
-    /// 絵文字一覧の確認と、その一覧から作る通知とバナー。
+    /// 絵文字の確認。カスタム絵文字の一覧から作る通知とバナーと、標準絵文字の画像の確認を含む。
     #[serde(default)]
     pub emoji: EmojiConfig,
     /// 前日のリアクションのランキング。
@@ -32,11 +33,12 @@ pub struct Config {
     pub mention: Option<MentionConfig>,
 }
 
-/// 絵文字一覧の確認。通知・バナー・ガチャ・占いのどれかを使うときに動く。
+/// 絵文字の確認。カスタム絵文字の一覧は通知・バナー・ガチャ・占いのどれかを使うとき、標準絵文字の画像は `unicode` があるときに
+/// 確かめる。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmojiConfig {
-    /// 状態（絵文字一覧の控えと画像）の置き場。省くと作業ディレクトリの `state`。
+    /// 状態（絵文字一覧の控えと画像、標準絵文字の控え）の置き場。省くと作業ディレクトリの `state`。
     pub state_dir: PathBuf,
     /// 確認する時刻（JST）。省くと 10 分ごと。
     #[serde(deserialize_with = "cron")]
@@ -45,6 +47,8 @@ pub struct EmojiConfig {
     pub notify: Option<NotifyConfig>,
     /// バナーの更新。
     pub banner: Option<BannerConfig>,
+    /// 標準絵文字の画像の確認。
+    pub unicode: Option<UnicodeEmojiConfig>,
 }
 
 impl Default for EmojiConfig {
@@ -54,6 +58,7 @@ impl Default for EmojiConfig {
             cron: default_check_cron(),
             notify: None,
             banner: None,
+            unicode: None,
         }
     }
 }
@@ -80,6 +85,15 @@ pub struct NotifyConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BannerConfig {}
+
+/// 標準絵文字（Unicode 絵文字）の画像の確認。Misskey が配る Twemoji の画像を全部取り、差し替えられていたら通知する。
+/// 確認の時刻は `[emoji]` の `cron`。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnicodeEmojiConfig {
+    #[serde(default)]
+    pub visibility: Visibility,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +226,11 @@ impl Config {
     pub fn needs_emoji_check(&self) -> bool {
         self.emoji.notify.is_some() || self.emoji.banner.is_some() || self.mention.is_some()
     }
+
+    /// 状態の置き場が要るか。絵文字一覧の確認か、標準絵文字の確認があるとき。
+    pub fn uses_state_dir(&self) -> bool {
+        self.needs_emoji_check() || self.emoji.unicode.is_some()
+    }
 }
 
 impl FromStr for Config {
@@ -281,9 +300,11 @@ token = "token"
         assert_eq!(config.emoji.cron, parse_cron(DEFAULT_CHECK_CRON).unwrap());
         assert!(config.emoji.notify.is_none());
         assert!(config.emoji.banner.is_none());
+        assert!(config.emoji.unicode.is_none());
         assert!(config.ranking.is_none());
         assert!(config.mention.is_none());
         assert!(!config.needs_emoji_check());
+        assert!(!config.uses_state_dir());
     }
 
     #[test]
@@ -298,6 +319,9 @@ cron = "*/5 * * * *"
 visibility = "specified"
 
 [emoji.banner]
+
+[emoji.unicode]
+visibility = "public"
 
 [ranking]
 visibility = "public"
@@ -321,6 +345,8 @@ categories = ["TEXT", "顔"]
             Visibility::Specified
         );
         assert!(config.emoji.banner.is_some());
+        let unicode = config.emoji.unicode.unwrap();
+        assert_eq!(unicode.visibility, Visibility::Public);
         let ranking = config.ranking.unwrap();
         assert_eq!(ranking.visibility, Visibility::Public);
         assert_eq!(ranking.cron, parse_cron("0 30 0 * * *").unwrap());
@@ -343,6 +369,14 @@ categories = ["TEXT", "顔"]
         // [emoji] は確認の設定だけで、機能の節ではない。
         let settings_only = parse(&format!("{MINIMAL}\n[emoji]\nstate_dir = \"x\"\n")).unwrap();
         assert!(!settings_only.needs_emoji_check());
+    }
+
+    #[test]
+    fn the_unicode_emoji_check_uses_the_state_dir_without_the_emoji_check() {
+        let config = parse(&format!("{MINIMAL}\n[emoji.unicode]\n")).unwrap();
+        assert!(!config.needs_emoji_check());
+        assert!(config.uses_state_dir());
+        assert_eq!(config.emoji.unicode.unwrap().visibility, Visibility::Home);
     }
 
     #[test]
@@ -401,6 +435,7 @@ categories = ["TEXT", "顔"]
         assert!(
             config.emoji.notify.is_some()
                 && config.emoji.banner.is_some()
+                && config.emoji.unicode.is_some()
                 && config.ranking.is_some()
         );
         let mention = config.mention.unwrap();
