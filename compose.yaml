@@ -15,7 +15,7 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      # 状態（絵文字一覧の控えと画像）。state_dir の既定 state は、コンテナの作業ディレクトリ /app から引くのでここを指す。名前付きボリュームにし、コンテナを作り直しても残す
+      # 状態（絵文字一覧の控えと画像、標準絵文字の控え）。state_dir の既定 state は、コンテナの作業ディレクトリ /app から引くのでここを指す。名前付きボリュームにし、コンテナを作り直しても残す
       - state:/app/state
 
 volumes:

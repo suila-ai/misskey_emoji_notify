@@ -1,7 +1,7 @@
 //! Misskey のカスタム絵文字の変更を通知する bot。
 //!
-//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿し、全絵文字を並べたバナーを作り、前日のリアクションのランキングを投稿し、
-//! メンションにガチャと占いで応答する。
+//! 絵文字一覧を定期に確かめて追加・削除・変更を投稿し、全絵文字を並べたバナーを作り、標準絵文字の画像の差し替えを投稿し、
+//! 前日のリアクションのランキングを投稿し、メンションにガチャと占いで応答する。
 
 mod banner;
 mod config;
@@ -15,20 +15,22 @@ mod scheduler;
 mod ssv;
 mod state;
 mod time;
+mod unicode_emoji;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use croner::Cron;
+use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::emoji::EmojiSet;
 use crate::images::HttpImageFetcher;
-use crate::jobs::{EmojiCheckJob, Job, RankingJob};
+use crate::jobs::{EmojiCheckJob, Job, RankingJob, UnicodeEmojiCheckJob};
 use crate::misskey::MiapiMisskey;
 
 #[tokio::main]
@@ -78,23 +80,39 @@ async fn run() -> Result<(), Error> {
 
     let emoji_set = SharedEmojiSet::default();
 
+    // 状態の置き場は絵文字の確認にしか使わない。確認しない設定でも作ると、作れない場所では起動に失敗する。
+    if config.uses_state_dir() {
+        state::create_dir(&config.emoji.state_dir)?;
+    }
     let shutdown = CancellationToken::new();
     let emoji_check = if config.needs_emoji_check() {
-        // 状態の置き場は絵文字一覧の確認にしか使わない。確認しない設定でも作ると、作れない場所では起動に失敗する。
-        state::create_dir(&config.emoji.state_dir)?;
         *emoji_set
             .write()
             .expect("the emoji set lock is not poisoned") = load_emoji_set(&config).map(Arc::new);
         Some(EmojiCheckJob::new(
             &misskey,
-            HttpImageFetcher::new(http),
+            HttpImageFetcher::new(http.clone()),
             &config.emoji,
             emoji_set.clone(),
         ))
     } else {
-        info!("no notify, banner, gacha or fortune is configured; the emoji check will not run");
+        info!(
+            "no notify, banner, gacha or fortune is configured; the custom emoji check will not run"
+        );
         None
     };
+    let unicode_emoji_check = config.emoji.unicode.as_ref().map(|unicode| {
+        let job = UnicodeEmojiCheckJob::new(
+            &misskey,
+            HttpImageFetcher::new(http.clone()),
+            &config.misskey.server,
+            unicode,
+            &config.emoji.state_dir,
+            load_unicode_snapshot(&config),
+            unicode_emoji::all(),
+        );
+        (job, &config.emoji.cron)
+    });
     let ranking = config.ranking.as_ref().map(|ranking| {
         let job = RankingJob::new(&misskey, ranking, time::now, shutdown.clone());
         (job, &ranking.cron)
@@ -127,6 +145,7 @@ async fn run() -> Result<(), Error> {
     tokio::join!(
         signals,
         run_if_configured(emoji_check.map(|job| (job, &config.emoji.cron)), &shutdown),
+        run_if_configured(unicode_emoji_check, &shutdown),
         run_if_configured(ranking, &shutdown),
         mentions,
     );
@@ -142,21 +161,32 @@ async fn run_if_configured<J: Job>(job: Option<(J, &Cron)>, shutdown: &Cancellat
     }
 }
 
-/// 前回の絵文字一覧を状態ファイルから読む。無いか読めなければ `None`（初回として、次の確認では投稿しない）。
+/// 前回の絵文字一覧を状態ファイルから読む。
 fn load_emoji_set(config: &config::Config) -> Option<EmojiSet> {
     let path = emoji::state_file(&config.emoji.state_dir);
-    match state::load::<Vec<emoji::StoredEmoji>>(&path) {
-        Ok(Some(emojis)) => {
-            let set = EmojiSet::from_stored(emojis);
-            info!(path = %path.display(), emojis = set.len(), "emoji state loaded");
-            Some(set)
-        }
+    let set = EmojiSet::from_stored(load_state::<Vec<emoji::StoredEmoji>>(&path)?);
+    info!(path = %path.display(), emojis = set.len(), "emoji state loaded");
+    Some(set)
+}
+
+/// 前回の標準絵文字の画像の控えを状態ファイルから読む。
+fn load_unicode_snapshot(config: &config::Config) -> Option<unicode_emoji::Snapshot> {
+    let path = unicode_emoji::state_file(&config.emoji.state_dir);
+    let snapshot: unicode_emoji::Snapshot = load_state(&path)?;
+    info!(path = %path.display(), images = snapshot.len(), "unicode emoji state loaded");
+    Some(snapshot)
+}
+
+/// 状態ファイルを読む。無いか読めなければ `None`（初回として、次の確認では投稿しない）。
+fn load_state<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    match state::load(path) {
+        Ok(Some(value)) => Some(value),
         Ok(None) => {
-            info!(path = %path.display(), "no emoji state; the first check will only take a snapshot");
+            info!(path = %path.display(), "no state; the first check will only take a snapshot");
             None
         }
         Err(error) => {
-            warn!(path = %path.display(), error = %error_chain(&error), "starting without the emoji state; the first check will only take a snapshot");
+            warn!(path = %path.display(), error = %error_chain(&error), "starting without the state; the first check will only take a snapshot");
             None
         }
     }

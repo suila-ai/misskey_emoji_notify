@@ -5,9 +5,11 @@
 
 pub mod emoji_check;
 pub mod ranking;
+pub mod unicode_emoji;
 
 pub use emoji_check::EmojiCheckJob;
 pub use ranking::RankingJob;
+pub use unicode_emoji::UnicodeEmojiCheckJob;
 
 use chrono::{DateTime, FixedOffset};
 use tracing::{error, info};

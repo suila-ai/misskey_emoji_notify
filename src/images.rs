@@ -54,12 +54,21 @@ pub enum Error {
         #[source]
         source: reqwest::Error,
     },
+    #[error("the response from {url} is not an image ({bytes} bytes)")]
+    NotImage { url: String, bytes: usize },
     #[error("failed to write the image file {path}")]
     Write {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
+}
+
+impl Error {
+    /// 404 で失敗したか。
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Http { source, .. } if source.status() == Some(reqwest::StatusCode::NOT_FOUND))
+    }
 }
 
 /// reqwest で取る実装。
@@ -126,6 +135,9 @@ pub async fn sync<F: ImageFetcher>(fetcher: &F, old: &EmojiSet, new: &mut EmojiS
 ///
 /// 前回の控えがあれば、その `ETag` で条件付き要求にし、`304` なら前回の控えを引き継ぐ。
 /// 取得に失敗したものと、[`SYNC_DEADLINE`] までに取れなかったものも前回の控えを引き継ぐ（無ければ `None` のまま）。
+/// 失敗は、回ごとに件数と最初のエラーを 1 行の warn にまとめ、URL ごとには debug で出す。サーバが止まっている回に、
+/// URL の数だけ warn を並べないため。前回の控えが無い URL の 404 は取り直しても変わらない（サーバの Twemoji より新しい版の
+/// 標準絵文字は毎回 404 になる）ので、warn の件数に入れない。前回は取れていた URL の 404 は画像が消えたことなので、入れる。
 /// `dir` があれば画像ファイルを `{sha1}.{ext}` で置き、同じ名前で同じ大きさのファイルがあれば書き直さない。
 pub async fn sync_urls<F: ImageFetcher, K>(
     fetcher: &F,
@@ -133,23 +145,33 @@ pub async fn sync_urls<F: ImageFetcher, K>(
     dir: Option<&Path>,
 ) -> Vec<(K, Option<ImageInfo>)> {
     let deadline = tokio::time::Instant::now() + SYNC_DEADLINE;
-    let results: Vec<(K, Option<ImageInfo>, bool)> = stream::iter(targets)
+    let results: Vec<(K, Option<ImageInfo>, Outcome)> = stream::iter(targets)
         .map(|(key, url, previous)| async move {
             let fetched =
-                tokio::time::timeout_at(deadline, fetch_one(fetcher, &url, previous.clone(), dir))
+                tokio::time::timeout_at(deadline, fetch_one(fetcher, &url, previous.as_ref(), dir))
                     .await;
             match fetched {
-                Ok(image) => (key, image, false),
-                Err(_) => (key, previous, true),
+                Ok(Ok(image)) => (key, image.or(previous), Outcome::Fetched),
+                Ok(Err(error)) => {
+                    debug!(url, error = %crate::error_chain(&error), "failed to fetch the image; keeping the previous one");
+                    (key, previous, Outcome::Failed(error))
+                }
+                Err(_) => (key, previous, Outcome::TimedOut),
             }
         })
         .buffer_unordered(CONCURRENCY)
         .collect()
         .await;
-    let timed_out = results
-        .iter()
-        .filter(|(_, _, timed_out)| *timed_out)
-        .count();
+    let mut timed_out = 0;
+    let mut failed = Vec::new();
+    for (_, image, outcome) in &results {
+        match outcome {
+            Outcome::Fetched => {}
+            Outcome::TimedOut => timed_out += 1,
+            Outcome::Failed(error) if error.is_not_found() && image.is_none() => {}
+            Outcome::Failed(error) => failed.push(error),
+        }
+    }
     if timed_out > 0 {
         warn!(
             timed_out,
@@ -157,65 +179,64 @@ pub async fn sync_urls<F: ImageFetcher, K>(
             "some images were not fetched in time; keeping the previous ones"
         );
     }
+    if let Some(first) = failed.first() {
+        warn!(failed = failed.len(), first = %crate::error_chain(*first), "some images could not be fetched; keeping the previous ones");
+    }
     results
         .into_iter()
         .map(|(key, image, _)| (key, image))
         .collect()
 }
 
+/// 画像 1 つの取得の結果。取れなかったものは前回の控えを引き継ぐ。
+enum Outcome {
+    Fetched,
+    Failed(Error),
+    /// [`SYNC_DEADLINE`] までに取れなかった。
+    TimedOut,
+}
+
+/// `url` の画像を取る。`304` なら `None`（呼び出し側が前回の控えを引き継ぐ）。
 async fn fetch_one<F: ImageFetcher>(
     fetcher: &F,
     url: &str,
-    previous: Option<ImageInfo>,
+    previous: Option<&ImageInfo>,
     dir: Option<&Path>,
-) -> Option<ImageInfo> {
+) -> Result<Option<ImageInfo>, Error> {
     // 前回の画像ファイルが消えているか空なら、304 でも取り直す必要があるので条件を付けない。
     // ファイルを置かないときは、前回の控えがあれば付ける。
     let etag = previous
-        .as_ref()
         .filter(|image| dir.is_none_or(|dir| has_content(&dir.join(image.file_name()))))
         .and_then(|image| image.etag.as_deref());
-    match fetcher.fetch(url, etag).await {
-        Ok(Fetched::NotModified) => {
+    let (actual_url, etag, data) = match fetcher.fetch(url, etag).await? {
+        Fetched::NotModified => {
             debug!(url, "image not modified");
-            previous
+            return Ok(None);
         }
-        Ok(Fetched::Image {
+        Fetched::Image {
             actual_url,
             etag,
             data,
-        }) => {
-            // 200 で返ったエラーページを画像の変更と取り違えないよう、画像でない応答は取得の失敗として扱う。
-            let Some(format) = detect_format(&data) else {
-                warn!(
-                    url,
-                    bytes = data.len(),
-                    "the response is not an image; keeping the previous one"
-                );
-                return previous;
-            };
-            let image = ImageInfo {
-                actual_url,
-                sha1: sha1_hex(&data),
-                format: format.to_owned(),
-                etag,
-            };
-            if let Some(dir) = dir {
-                let path = dir.join(image.file_name());
-                if !is_saved(&path, data.len())
-                    && let Err(error) = write_file(&path, &data)
-                {
-                    warn!(url, error = %crate::error_chain(&error), "failed to save the image; keeping the previous one");
-                    return previous;
-                }
-            }
-            Some(image)
-        }
-        Err(error) => {
-            warn!(url, error = %crate::error_chain(&error), "failed to fetch the image; keeping the previous one");
-            previous
+        } => (actual_url, etag, data),
+    };
+    // 200 で返ったエラーページを画像の変更と取り違えないよう、画像でない応答は取得の失敗として扱う。
+    let format = detect_format(&data).ok_or_else(|| Error::NotImage {
+        url: url.to_owned(),
+        bytes: data.len(),
+    })?;
+    let image = ImageInfo {
+        actual_url,
+        sha1: sha1_hex(&data),
+        format: format.to_owned(),
+        etag,
+    };
+    if let Some(dir) = dir {
+        let path = dir.join(image.file_name());
+        if !is_saved(&path, data.len()) {
+            write_file(&path, &data)?;
         }
     }
+    Ok(Some(image))
 }
 
 /// `path` に `len` バイトのファイルがあるか。書きかけで切れたファイルは大きさが違うので、書き直す。
@@ -286,12 +307,47 @@ pub fn sha1_hex(data: &[u8]) -> String {
 
 /// マジックナンバーで画像の形式（拡張子）を判定する。画像でなければ `None`。
 ///
-/// SVG も画像としない。Misskey は SVG を絵文字に登録できず（UNSUPPORTED_FILE_TYPE）、`<?xml` で始まる XHTML の
-/// エラーページと見分けられないため。
+/// SVG（Twemoji の形式）は、根要素が `<svg` のものだけ画像とする。XHTML や HTML のエラーページは根要素が `<html` なので
+/// 画像にならない。
 fn detect_format(data: &[u8]) -> Option<&'static str> {
     image::guess_format(data)
         .ok()
         .map(|format| format.extensions_str()[0])
+        .or_else(|| is_svg(data).then_some("svg"))
+}
+
+/// 根要素が `<svg` か。根要素は最初の開始タグ（`<` の次が英字）とし、その前の XML 宣言・コメント・DOCTYPE（`<?` か `<!`
+/// で始まる）は飛ばす。Inkscape や Illustrator の書き出しは、根要素の前にコメントや DOCTYPE を置く。コメントは `-->` までを
+/// 飛ばし、中に書かれたタグを根要素と取り違えない。
+/// 先頭の BOM と空白の次が `<` でないもの（JSON や平文）は、中に `<svg` があっても SVG としない。
+fn is_svg(data: &[u8]) -> bool {
+    let mut rest = data
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(data)
+        .trim_ascii_start();
+    if !rest.starts_with(b"<") {
+        return false;
+    }
+    loop {
+        let Some(start) = rest.iter().position(|&byte| byte == b'<') else {
+            return false;
+        };
+        rest = &rest[start + 1..];
+        if let Some(comment) = rest.strip_prefix(b"!--") {
+            let Some(end) = comment.windows(3).position(|three| three == b"-->") else {
+                return false;
+            };
+            rest = &comment[end + 3..];
+        } else if rest.first().is_some_and(u8::is_ascii_alphabetic) {
+            break;
+        }
+    }
+    rest.strip_prefix(b"svg").is_some_and(|after| {
+        matches!(
+            after.first(),
+            Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
+        )
+    })
 }
 
 /// テストで使う、メモリ上の取得元。
@@ -360,6 +416,11 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::fake::{FakeFetcher, Response};
     use super::*;
     use crate::emoji::test_support::{stored, with_image};
@@ -375,12 +436,135 @@ mod tests {
         assert_eq!(detect_format(&[0xFF, 0xD8, 0xFF]), Some("jpg"));
         assert_eq!(detect_format(b"RIFF....WEBPVP8 "), Some("webp"));
         assert_eq!(detect_format(b"\0\0\0\x1cftypavif"), Some("avif"));
-        assert_eq!(
-            detect_format(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
-            None
-        );
         assert_eq!(detect_format(b"hello"), None);
         assert_eq!(detect_format(b""), None);
+    }
+
+    #[test]
+    fn only_a_document_whose_root_is_svg_is_an_svg() {
+        assert_eq!(
+            detect_format(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            Some("svg")
+        );
+        assert_eq!(
+            detect_format(
+                b"\xEF\xBB\xBF  <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg>\n</svg>"
+            ),
+            Some("svg")
+        );
+        assert_eq!(detect_format(b"<svg>"), Some("svg"));
+        assert_eq!(
+            detect_format(
+                b"<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\"></html>"
+            ),
+            None
+        );
+        assert_eq!(detect_format(b"<svgx/>"), None);
+        assert_eq!(detect_format(b"<?xml version=\"1.0\"?><svg"), None);
+        assert_eq!(
+            detect_format(b"<!DOCTYPE html><html><body>maintenance</body></html>"),
+            None
+        );
+        // Inkscape、Blobmoji、Illustrator の書き出しは、根要素の前にコメントや DOCTYPE を置く。
+        assert_eq!(
+            detect_format(
+                b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n\
+                  <!-- Created with Inkscape (http://www.inkscape.org/) -->\n\n<svg\n   width=\"36\">"
+            ),
+            Some("svg")
+        );
+        assert_eq!(
+            detect_format(
+                b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n\
+                  <!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \
+                  \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n<svg width=\"100%\">"
+            ),
+            Some("svg")
+        );
+        assert_eq!(
+            detect_format(
+                b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                  <!-- Generator: Adobe Illustrator 16.0.0, SVG Export Plug-In -->\n\
+                  <!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \
+                  \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\" [\n\
+                  \t<!ENTITY ns_svg \"http://www.w3.org/2000/svg\">\n]>\n<svg version=\"1.1\">"
+            ),
+            Some("svg")
+        );
+        // コメントは `-->` までを飛ばし、中のタグを根要素にしない。
+        assert_eq!(
+            detect_format(b"<?xml version=\"1.0\"?>\n<!-- by <b>x</b> -->\n<svg>"),
+            Some("svg")
+        );
+        assert_eq!(
+            detect_format(b"<!-- <svg> sample --><html><body>error</body></html>"),
+            None
+        );
+        assert_eq!(detect_format(b"<!-- <svg>"), None);
+        // マークアップで始まらないものは、中に `<svg` があっても SVG としない。
+        assert_eq!(detect_format(b"{\"error\":{\"message\":\"<svg>\"}}"), None);
+    }
+
+    #[tokio::test]
+    async fn a_404_is_not_found_and_other_failures_are_not() {
+        let server = MockServer::start().await;
+        Mock::given(path("/missing.svg"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(path("/broken.svg"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let fetcher = HttpImageFetcher::new(reqwest::Client::new());
+        let missing = fetcher
+            .fetch(&format!("{}/missing.svg", server.uri()), None)
+            .await
+            .unwrap_err();
+        assert!(missing.is_not_found(), "{missing}");
+        let broken = fetcher
+            .fetch(&format!("{}/broken.svg", server.uri()), None)
+            .await
+            .unwrap_err();
+        assert!(!broken.is_not_found(), "{broken}");
+    }
+
+    #[tokio::test]
+    async fn sync_urls_without_a_dir_writes_no_file_and_sends_the_previous_etag() {
+        let fetcher = FakeFetcher::default()
+            .with("u-a", Response::Image(PNG.to_vec(), Some("\"tag-a\"")))
+            .with("u-b", Response::Cached(GIF.to_vec(), "\"tag-b\""));
+        let previous = ImageInfo {
+            actual_url: "u-b#actual".to_owned(),
+            sha1: sha1_hex(GIF),
+            format: "gif".to_owned(),
+            etag: Some("\"tag-b\"".to_owned()),
+        };
+        let results: HashMap<&str, Option<ImageInfo>> = sync_urls(
+            &fetcher,
+            vec![
+                ("a", "u-a".to_owned(), None),
+                ("b", "u-b".to_owned(), Some(previous.clone())),
+            ],
+            None,
+        )
+        .await
+        .into_iter()
+        .collect();
+        let a = results["a"].clone().unwrap();
+        assert_eq!(a.sha1, sha1_hex(PNG));
+        assert_eq!(a.etag.as_deref(), Some("\"tag-a\""));
+        // 画像ファイルを置かないので、ファイルの有無を見ずに前回の ETag を付け、304 なら前回の控えのまま。
+        assert_eq!(results["b"], Some(previous));
+        let mut calls = fetcher.calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                ("u-a".to_owned(), None),
+                ("u-b".to_owned(), Some("\"tag-b\"".to_owned())),
+            ]
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
 croner = "4.0.2"
+emojis = "0.9.1"
 futures-util = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp", "tiff", "ico"] }
 miapi = { git = "https://github.com/suila-ai/miapi", default-features = false, features = ["v2025.10.0", "streaming"] }

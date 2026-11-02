@@ -3,6 +3,7 @@
 pub mod emoji;
 pub mod mention;
 pub mod ranking;
+pub mod unicode_emoji;
 
 /// ノートの本文の上限。Misskey の `maxNoteTextLength` の既定で、接続先のサーバも同じ。
 pub const MAX_NOTE_LENGTH: usize = 3000;
