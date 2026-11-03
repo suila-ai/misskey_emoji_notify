@@ -1186,7 +1186,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "miapi"
 version = "0.1.0"
-source = "git+https://github.com/suila-ai/miapi#eb7c06b7bbc77cfcc0351a770237fb6d267068c1"
+source = "git+https://github.com/suila-ai/miapi#1b15a13d93557819032dca20ab2d8232e89cee0c"
 dependencies = [
  "bytes",
  "chrono",
